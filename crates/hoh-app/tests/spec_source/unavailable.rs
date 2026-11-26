@@ -217,3 +217,129 @@ async fn spec_source_join_failure_answers_spec_source_unavailable() -> R {
     }
     Ok(())
 }
+
+// M4L1-002: a spawn_blocking JoinError on ApproveSpec / ProposeSpecChange must be mapped into
+// SpecReadError::Unavailable and passed to the store so missing-run, stale-revision, replay and
+// Reject keep their own answers instead of 503 SPEC_SOURCE_UNAVAILABLE.
+#[tokio::test]
+async fn spec_source_join_failure_lets_store_decide_reject_replay_stale_and_missing() -> R {
+    let world = World::new()?;
+    let original = repository(&world)?;
+    let fail = std::sync::Arc::new(FailSpecSourceRead(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    let host = host_with_spec_read_fault(&world, std::sync::Arc::clone(&fail)).await?;
+    let run = world::start_run(&host, "start", "join error store decisions").await?;
+
+    // 1. Missing run -> 409 RUN_NOT_FOUND (not 503) for both ApproveSpec and ProposeSpecChange.
+    for (kind, payload) in [
+        (
+            "ApproveSpec",
+            json!({"spec_sha256": original.sha256(), "decision": "APPROVE_ONLY"}),
+        ),
+        (
+            "ProposeSpecChange",
+            json!({"spec_sha256": original.sha256(), "reason": "missing run"}),
+        ),
+    ] {
+        let missing_body = json!({
+            "schema_version": "1.0",
+            "command_id": format!("missing-{kind}"),
+            "idempotency_key": format!("missing-{kind}"),
+            "run_id": "no-such-run",
+            "expected_revision": 0,
+            "kind": kind,
+            "payload": payload,
+        });
+        fail.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, response) =
+            world::exchange(&host, "POST", "/v1/commands", Some(&missing_body)).await?;
+        assert_eq!(status, 409, "{kind} missing run: {response}");
+        assert_eq!(response["code"], "RUN_NOT_FOUND", "{kind}: {response}");
+    }
+
+    // 2. Stale revision -> 409 STALE_REVISION (not 503) for both ApproveSpec and ProposeSpecChange.
+    for (kind, payload) in [
+        (
+            "ApproveSpec",
+            json!({"spec_sha256": original.sha256(), "decision": "APPROVE_ONLY"}),
+        ),
+        (
+            "ProposeSpecChange",
+            json!({"spec_sha256": original.sha256(), "reason": "stale rev"}),
+        ),
+    ] {
+        let mut stale_body = command(&host, &run, &format!("stale-{kind}"), kind, payload).await?;
+        stale_body["expected_revision"] = json!(999);
+        fail.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, response) =
+            world::exchange(&host, "POST", "/v1/commands", Some(&stale_body)).await?;
+        assert_eq!(status, 409, "{kind} stale revision: {response}");
+        assert_eq!(response["code"], "STALE_REVISION", "{kind}: {response}");
+    }
+
+    // 3. Replay of an accepted ApproveSpec and ProposeSpecChange -> 202 replay (not 503).
+    let approve_body = command(
+        &host,
+        &run,
+        "approve-rev1",
+        "ApproveSpec",
+        json!({"spec_sha256": original.sha256(), "decision": "APPROVE_ONLY"}),
+    )
+    .await?;
+    let (status, response) =
+        world::exchange(&host, "POST", "/v1/commands", Some(&approve_body)).await?;
+    assert_eq!(status, 202, "initial approve: {response}");
+    let after_approve = snapshot(&world)?;
+    fail.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, response) =
+        world::exchange(&host, "POST", "/v1/commands", Some(&approve_body)).await?;
+    assert_eq!(
+        status, 202,
+        "ApproveSpec replay under join error: {response}"
+    );
+    assert_eq!(snapshot(&world)?, after_approve);
+
+    let revised = revise_a(&world)?;
+    let propose_body = command(
+        &host,
+        &run,
+        "propose-rev2",
+        "ProposeSpecChange",
+        json!({"spec_sha256": revised.sha256(), "reason": "propose for replay and reject"}),
+    )
+    .await?;
+    let (status, response) =
+        world::exchange(&host, "POST", "/v1/commands", Some(&propose_body)).await?;
+    assert_eq!(status, 202, "initial propose: {response}");
+    let after_propose = snapshot(&world)?;
+    fail.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, response) =
+        world::exchange(&host, "POST", "/v1/commands", Some(&propose_body)).await?;
+    assert_eq!(
+        status, 202,
+        "ProposeSpecChange replay under join error: {response}"
+    );
+    assert_eq!(snapshot(&world)?, after_propose);
+
+    // 4. Reject on the pending proposal -> 202 ACCEPTED (not 503), even when the spec-source join panics.
+    let reject_body = command(
+        &host,
+        &run,
+        "reject-rev2",
+        "ApproveSpec",
+        json!({"spec_sha256": revised.sha256(), "decision": "REJECT"}),
+    )
+    .await?;
+    fail.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, response) =
+        world::exchange(&host, "POST", "/v1/commands", Some(&reject_body)).await?;
+    assert_eq!(status, 202, "Reject under join error: {response}");
+    assert_eq!(
+        world.query("SELECT state FROM change_requests")?,
+        "REJECTED"
+    );
+
+    host.shutdown().await;
+    Ok(())
+}
