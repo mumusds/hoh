@@ -983,3 +983,27 @@ Scope `072f9fa6..8dcea551` (round 1) and the fix diff `8dcea551..3b13ff12` (roun
 | 2 (fix diff) | `3b13ff12` | Codex 0.171.0, `01a215de-e804-7932-b2db-4b41f5c41b4c` (`5b7120af-3818-43a2-9dd4-97531317c0c8`), M3F-300..399: audit completeness, hooks, tests | PASS, no findings: red on `0672061f` (UNKNOWN_EFFECT) and green 5/5 reproduced; caller audit complete; hooks no-op in production; guards reap on all nine paths |
 
 Out of scope, seen in the developer's first fix-round pre-pr: `tui_pty::a_signal_while_output_is_held_leaves_later_input_for_the_shell` failed once (`aecho NEXT`); tracked as FLK-16 on its own branch.
+
+## FLK-16 (initial-frame cursor write trapped by `hold_output` before key `a` is read)
+
+Developer diagnostics from `670f9bad`, REQ-001 / M1T08R-19, test `tui_pty::a_signal_while_output_is_held_leaves_later_input_for_the_shell` (`crates/hoh-app/tests/tui_pty.rs:412`). Failed once in a full `pre-pr` on an unrelated branch (`.hoh-dev/self-tests/flk16/ci-like-failure.log`): `assertion left == right failed: hoh read the input typed after the signal; left: "aecho NEXT\n" right: "echo NEXT\n"`.
+
+Chain (trigger -> symptom): ratatui's `Terminal::draw` emits the initial frame in two `write(2)` calls: first the frame diff (`write(5, "\x1b[1;1H...host 已连接...", 612)`), then cursor placement (`write(5, "\x1b[29;3H", 7)`). `open()` returns as soon as the PTY reader sees `"host 已连接"` from the first write, before the second write has returned and before `event_loop` reaches `wait(&stdin)` (`ppoll`). The test then immediately calls `s.pty.hold_output(true)` (`tcflow(TCOOFF)`), `s.pty.send(b"a")`, and `in_write(&s.child, WAIT)`. When `hoh` is scheduled slowly between the two initial-frame writes, `TCOOFF` traps `write(5, "\x1b[29;3H", 7)` in the kernel; `in_write` reads `/proc/<pid>/syscall` (`1 0x5 … 0x7`) and returns `Ok(())` while `'a'` is still unread in the PTY input queue. The test then sends `SIGTERM`, sends `"echo NEXT\n"`, and releases output (`TCOON`). Once `write(5, "\x1b[29;3H", 7)` completes, `hoh` enters `ppoll` (`POLLIN`), sees `signal != 0` at `crates/hoh-client/src/tui.rs:730`, skips `read(0, …)`, restores the terminal, and exits 143 — leaving both `'a'` and `"echo NEXT\n"` unread (`"aecho NEXT\n"`).
+
+Product verdict: the product is right (no product code changed). Per M1T08R-19 (`reports/reviews/M1.md`, `docs/adr/ADR-014.md`), a signal received while `hoh` is blocked in a draw must end `hoh` before it reads any queued stdin bytes; because `'a'` had never been read before `SIGTERM`, leaving `"aecho NEXT\n"` unread is the required behavior.
+
+Reproduction (before fix, under `/home/ai/dev/.hoh-test-slot.lock`):
+- 12 private CPU burners, 30 runs: **1/30 FAIL** (`repro-before-run-5.log`: `left: "aecho NEXT\n"`, `right: "echo NEXT\n"`).
+- Deterministic `strace -f -tt -e trace=read,write,poll,ppoll,ioctl,kill,tgkill -e inject=write:delay_exit=150ms`: **3/3 FAIL** (`strace-det-red-{1..3}.log`), capturing the exact sequence `write(5, "...host 已连接...", 612) = 612` -> `ioctl(6, TCXONC, TCOOFF)` -> `write(5, "a", 1)` -> `write(5, "\33[29;3H", 7 <unfinished ...>` -> `/proc/<pid>/syscall` read `"1 0x5 ... 0x7"` -> `kill(SIGTERM)` -> `write(5, "echo NEXT\n", 10)` -> `TCOON` -> `ppoll` (`POLLIN`) -> restore writes -> `exited with 143` with zero `read(0, …)` calls by `hoh`.
+
+Fix (test-only):
+- Added `pty::in_poll` (`crates/hoh-app/tests/pty/mod.rs`) checking `/proc/<pid>/syscall` for `poll`/`ppoll` (`7`/`271` on x86_64, `73` on aarch64) and exposed `Pty::wait_for_queued`.
+- `a_signal_while_output_is_held_leaves_later_input_for_the_shell` now waits for `in_poll(&s.child, WAIT)` after `open()` so the initial frame's cursor-placement write cannot be trapped by `hold_output(true)`, uses `send_and_wait_until_read(&s.child, b"a", WAIT)` before `in_write(&s.child, WAIT)` so `a` is confirmed read and `in_write` observes `a`'s draw, and waits for `"echo NEXT\n"` to be queued (`wait_for_queued`) before `hold_output(false)`. All existing assertions (`143`, `stty`, `"echo NEXT\n"`) are unchanged.
+- Audit of the other 38 tests in `tui_pty` (plus `s5` and `tui.rs`): no other caller of `hold_output` or `in_write` exists. Neighbor `an_unfinished_escape_sequence_holds_up_neither_the_exit_nor_the_next_input` had the related pre-signal read race (`send(b"\x1b[")` + `sleep(200ms)` before `SIGTERM` and `assert_eq!(unread, "echo NEXT\n")`); replaced with `send_and_wait_until_read(&s.child, b"\x1b[", WAIT)?`.
+
+Verification after fix (under `/home/ai/dev/.hoh-test-slot.lock`, same 12 CPU burners):
+- `a_signal_while_output_is_held_leaves_later_input_for_the_shell`: **30/30 PASS (0 FAIL)** (`repro-after-load.log`).
+- `an_unfinished_escape_sequence_holds_up_neither_the_exit_nor_the_next_input`: **20/20 PASS (0 FAIL)** (`repro-after-load.log`).
+- Regression/mutation check: temporarily disabling the M1T08R-19 pre-read guard in `crates/hoh-client/src/tui.rs:730` turned the fixed test red (`left: ""`, `right: "echo NEXT\n"`, `sabotage-m1t08r19.log`); reverted immediately.
+
+Evidence under `.hoh-dev/self-tests/flk16/`: `ci-like-failure.log`, `strace-single.log`, `repro-before-load.log`, `repro-before-run-5.log`, `strace-det-red-{1..3}.log`, `repro-after-load.log`, `sabotage-m1t08r19.log`. Self-tests, not acceptance.
