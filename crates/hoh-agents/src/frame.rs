@@ -401,7 +401,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 self.buf.capacity() + piece.len() + original.head.capacity() + json.buffered(),
             );
             if !valid || eof || original.length > self.reduce.map_or(0, |r| r.max_length) {
-                return Ok(self.refuse_reduced());
+                return Ok(self.refuse_reduced(end.is_some()));
             }
             if end.is_some() {
                 let Some((original, json)) = self.reducing.take() else {
@@ -436,9 +436,19 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         }
     }
 
-    fn refuse_reduced(&mut self) -> Option<Frame> {
+    fn refuse_reduced(&mut self, mut ended: bool) -> Option<Frame> {
         let (mut original, _) = self.reducing.take()?;
-        if std::mem::take(&mut original.cr) {
+        // The transition may have read more of this frame than the reducer consumed before
+        // refusing its structure. Diagnose all observed frame bytes, excluding later frames.
+        if !ended {
+            if let Some(end) = self.buf.iter().position(|&b| b == b'\n') {
+                original.take_last(&self.buf[..end]);
+                ended = true;
+            } else {
+                original.take_open(&self.buf);
+            }
+        }
+        if !ended && std::mem::take(&mut original.cr) {
             original.take(b"\r");
         }
         self.skipping = Some(original);
@@ -1023,6 +1033,24 @@ mod tests {
             }
             assert!(reader.max_buffered() <= FRAME_LIMIT + READ_CHUNK);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_027_06_m3cx001_refusal_counts_and_hashes_all_buffered_frame_bytes() -> R {
+        let raw = structured_item(FRAME_LIMIT + 1);
+        let input = [raw.as_slice(), b"\nafter\n"].concat();
+        let mut reader =
+            FrameReader::new(input.as_slice(), FRAME_LIMIT, READ_CHUNK).reducing(Skip {
+                known: item_head,
+                max_length: SKIP_LIMIT,
+            });
+        let Some(Frame::TooLarge(refused)) = reader.next().await? else {
+            return Err("expected structure budget refusal".into());
+        };
+        assert_eq!(refused.length, raw.len());
+        assert_eq!(refused.prefix_sha256, hex(&Sha256::digest(&raw)));
+        assert_eq!(refused.head, raw[..HEAD_BYTES]);
         Ok(())
     }
 
