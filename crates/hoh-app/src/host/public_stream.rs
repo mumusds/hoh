@@ -7,27 +7,51 @@ use hoh_core::persistence::PersistError;
 use std::{sync::Arc, time::Duration};
 pub(super) struct Drain {
     task: Option<tokio::task::JoinHandle<Result<(), &'static str>>>,
+    loss: hoh_agents::public_stream::Loss,
     executor: Arc<dyn Executor>,
     work: Work,
 }
+/// What the process-end gap says: why the public stream ended early, and what of it was lost (M4T09R-301).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EndGap {
+    pub(super) reason: &'static str,
+    pub(super) loss: hoh_agents::public_stream::LossSummary,
+}
+impl EndGap {
+    pub(super) fn payload(&self, attempt: &str, epoch: i64) -> serde_json::Value {
+        serde_json::json!({
+            "attempt_id": attempt,
+            "role_epoch": epoch,
+            "reason": self.reason,
+            "first_dropped_offset": self.loss.first_offset,
+            "dropped_parts": self.loss.dropped,
+            "unrecorded_parts": self.loss.unrecorded,
+            "dropped_bytes": self.loss.bytes,
+            "frames_after_close": self.loss.frames_after_close,
+            "complete": false,
+        })
+    }
+}
+/// Pauses before the second and third attempt at a dropped body's gap: all three take well under one quiet period
+/// (M4T09R-300).
+const GAP_RETRY: [Duration; 2] = [Duration::from_millis(50), Duration::from_millis(100)];
 impl Drain {
     pub(super) fn start(shared: Arc<Shared>, executor: Arc<dyn Executor>, work: Work) -> Self {
+        let mut loss = hoh_agents::public_stream::Loss::default();
         let task = executor.take_public_stream(&work).map(|mut receiver| {
+            loss = receiver.loss.clone();
             let attempt = work.attempt_id.clone();
             let epoch = work.assignment.role_epoch;
             let project = work.project_id.clone();
             let run = work.run_id.clone();
             super::begun::spawn(async move {
                 while let Some(pending) = receiver.recv().await {
+                    let part = &pending.part;
                     let mut blocked = None;
                     let mut since = None;
                     let mut persisted = false;
                     loop {
-                        match shared
-                            .store
-                            .record_public(&attempt, epoch, pending.part.clone())
-                            .await
-                        {
+                        match shared.store.record_public(&attempt, epoch, part.clone()).await {
                             Ok(_) => {
                                 persisted = true;
                                 break;
@@ -39,98 +63,37 @@ impl Drain {
                                 }
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                             }
-                            Err(PersistError::StorageLowSpace {
-                                available_bytes,
-                                required_bytes,
-                                min_free_bytes,
-                            }) => {
-                                drop(blocked.take());
-                                let block = hoh_core::ids::child_id(
-                                    &attempt,
-                                    &format!(
-                                        "public/{}/{}",
-                                        pending.part.native_stream, pending.part.block_key
-                                    ),
-                                );
-                                let event = hoh_core::persistence::NewEvent {
-                                    intent: hoh_core::persistence::Intent::Record,
-                                    project_id: project.clone(),
-                                    run_id: Some(run.clone()),
-                                    event_id: hoh_core::ids::child_id(
-                                        &attempt,
-                                        &format!(
-                                            "public/gap/{}/{}/{}/{}",
-                                            pending.part.native_stream,
-                                            pending.part.received_offset,
-                                            pending.part.native_item_id,
-                                            pending.part.part
-                                        ),
-                                    ),
-                                    kind: "public.gap".into(),
-                                    payload: serde_json::json!({
-                                        "block_id": block,
-                                        "attempt_id": attempt,
-                                        "role_epoch": epoch,
-                                        "native_stream": pending.part.native_stream,
-                                        "native_item_id": pending.part.native_item_id,
-                                        "received_offset": pending.part.received_offset,
-                                        "part": pending.part.part,
-                                        "reason": "storage_low_space",
-                                        "available_bytes": available_bytes,
-                                        "required_bytes": required_bytes,
-                                        "min_free_bytes": min_free_bytes,
-                                        "dropped_bytes": pending.part.text.len(),
-                                        "complete": false,
-                                    }),
-                                };
-                                commit_best_effort(&shared.store, event, "storage_low_space_gap")
-                                    .await;
-                                break;
-                            }
+                            // Low space, a full state DB and any other refusal drop this body: storage must not stall
+                            // the agent. Its gap takes the body's place (DC-M4T09a, M4T09R-300).
                             Err(err) => {
                                 drop(blocked.take());
-                                let block = hoh_core::ids::child_id(
-                                    &attempt,
-                                    &format!(
-                                        "public/{}/{}",
-                                        pending.part.native_stream, pending.part.block_key
+                                let (reason, details) = match &err {
+                                    PersistError::StorageLowSpace {
+                                        available_bytes,
+                                        required_bytes,
+                                        min_free_bytes,
+                                    } => (
+                                        "storage_low_space",
+                                        serde_json::json!({
+                                            "available_bytes": available_bytes,
+                                            "required_bytes": required_bytes,
+                                            "min_free_bytes": min_free_bytes,
+                                        }),
                                     ),
-                                );
-                                let event = hoh_core::persistence::NewEvent {
-                                    intent: hoh_core::persistence::Intent::Record,
-                                    project_id: project.clone(),
-                                    run_id: Some(run.clone()),
-                                    event_id: hoh_core::ids::child_id(
-                                        &attempt,
-                                        &format!(
-                                            "public/gap/{}/{}/{}/{}",
-                                            pending.part.native_stream,
-                                            pending.part.received_offset,
-                                            pending.part.native_item_id,
-                                            pending.part.part
-                                        ),
+                                    other => (
+                                        "public_storage_error",
+                                        serde_json::json!({"error": other.to_string()}),
                                     ),
-                                    kind: "public.gap".into(),
-                                    payload: serde_json::json!({
-                                        "block_id": block,
-                                        "attempt_id": attempt,
-                                        "role_epoch": epoch,
-                                        "native_stream": pending.part.native_stream,
-                                        "native_item_id": pending.part.native_item_id,
-                                        "received_offset": pending.part.received_offset,
-                                        "part": pending.part.part,
-                                        "reason": "public_storage_error",
-                                        "error": err.to_string(),
-                                        "dropped_bytes": pending.part.text.len(),
-                                        "complete": false,
-                                    }),
                                 };
-                                commit_best_effort(&shared.store, event, "public_storage_error_gap")
-                                    .await;
+                                let recorded =
+                                    record_gap(&shared.store, &attempt, epoch, part, reason, details)
+                                        .await;
+                                receiver.loss.dropped(part, recorded);
                                 break;
                             }
                         }
                     }
+                    receiver.loss.settled();
                     drop(blocked);
                     if persisted && let Some(since) = since {
                         let event = hoh_core::persistence::NewEvent {
@@ -141,10 +104,10 @@ impl Drain {
                                 &attempt,
                                 &format!(
                                     "public/backpressure/{}/{}/{}/{}",
-                                    pending.part.native_stream,
-                                    pending.part.received_offset,
-                                    pending.part.native_item_id,
-                                    pending.part.part
+                                    part.native_stream,
+                                    part.received_offset,
+                                    part.native_item_id,
+                                    part.part
                                 ),
                             ),
                             kind: "runner.diagnostic".into(),
@@ -165,12 +128,14 @@ impl Drain {
         });
         Self {
             task,
+            loss,
             executor,
             work,
         }
     }
-    pub(super) async fn finish(mut self) -> Option<&'static str> {
-        if let Some(task) = self.task.as_mut() {
+    /// The process-end gap, if the stream ended early or lost output that no gap of its own records.
+    pub(super) async fn finish(mut self) -> Option<EndGap> {
+        let reason = if let Some(task) = self.task.as_mut() {
             // Local storage cannot hold up process end, cancellation or the runner's budget accounting indefinitely.
             match tokio::time::timeout(Duration::from_secs(1), &mut *task).await {
                 Ok(Ok(Ok(()))) => None,
@@ -184,6 +149,15 @@ impl Drain {
             }
         } else {
             None
+        };
+        let loss = self.loss.summary();
+        match reason {
+            Some(reason) => Some(EndGap { reason, loss }),
+            None if loss.needs_gap() => Some(EndGap {
+                reason: "public_output_lost",
+                loss,
+            }),
+            None => None,
         }
     }
 }
@@ -196,7 +170,47 @@ impl Drop for Drain {
     }
 }
 
-/// Best-effort diagnostics and inline gaps never end the drain task (DC-M4T09a).
+/// A dropped body's gap, in its place and with its attempt's identity (M4T09R-201), tried a bounded number of times
+/// (M4T09R-300). Whether it was written.
+async fn record_gap(
+    store: &hoh_core::persistence::Store,
+    attempt: &str,
+    epoch: i64,
+    part: &hoh_core::public_output::PublicPart,
+    reason: &str,
+    details: serde_json::Value,
+) -> bool {
+    let mut place = part.clone();
+    place.text = String::new();
+    let drop = hoh_core::public_output::PublicDrop {
+        part: place,
+        dropped_bytes: part.text.len() as u64,
+        reason: reason.to_owned(),
+        details: match details {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        },
+    };
+    let mut last = None;
+    for pause in std::iter::once(None).chain(GAP_RETRY.map(Some)) {
+        if let Some(pause) = pause {
+            tokio::time::sleep(pause).await;
+        }
+        match store.record_public_gap(attempt, epoch, drop.clone()).await {
+            Ok(_) => return true,
+            Err(err) => last = Some(err),
+        }
+    }
+    if let Some(err) = last {
+        eprintln!(
+            "public stream {reason} gap not recorded after {} attempts: {err}",
+            GAP_RETRY.len() + 1
+        );
+    }
+    false
+}
+
+/// Best-effort diagnostics never end the drain task (DC-M4T09a).
 async fn commit_best_effort(
     store: &hoh_core::persistence::Store,
     event: hoh_core::persistence::NewEvent,
@@ -312,6 +326,7 @@ mod tests {
         started.await.expect("task started");
         let drain = Drain {
             task: Some(task),
+            loss: hoh_agents::public_stream::Loss::default(),
             executor: Arc::new(Idle),
             work: work(None),
         };

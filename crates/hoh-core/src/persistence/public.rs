@@ -238,6 +238,66 @@ pub(super) fn native(
     Ok(Some(seq))
 }
 
+/// The gap of a dropped public body (M4T09R-201): the identity [`native`] binds, the dropped part's place
+/// (stream, first_offset, received_offset) and why, in the part's own block, so a session-filtered view shows it.
+pub(super) fn dropped(
+    conn: &mut Connection,
+    attempt: &str,
+    epoch: i64,
+    drop: &crate::public_output::PublicDrop,
+    ctx: &writer::Ctx<'_>,
+) -> Result<Option<i64>, PersistError> {
+    let part = &drop.part;
+    let tx = writer::begin(conn, ctx)?;
+    let facts:Option<NativeIdentity>=tx.query_row("SELECT r.project_id,t.run_id,t.task_id,t.role,a.role_epoch,a.session_id,a.config_revision,t.spec_id FROM attempts a JOIN tasks t USING(task_id) JOIN runs r USING(run_id) WHERE attempt_id=?1",[attempt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional().map_err(sqlite_error)?;
+    let Some((project, run, task, role, actual, session, revision, spec)) = facts else {
+        return Err(PersistError::IntegrityViolation(
+            "public gap has no attempt".into(),
+        ));
+    };
+    if actual != Some(epoch) || epoch <= 0 {
+        return Err(PersistError::IntegrityViolation(
+            "public gap epoch differs from its attempt".into(),
+        ));
+    }
+    let prior:Option<i64>=tx.query_row("SELECT created_seq FROM public_native_parts WHERE attempt_id=?1 AND native_stream=?2 AND native_item_id=?3 AND part=?4",params![attempt,part.native_stream,part.native_item_id,sql_number(part.part)?],|r|r.get(0)).optional().map_err(sqlite_error)?;
+    if let Some(seq) = prior {
+        return Ok(Some(seq));
+    }
+    let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM role_bindings b JOIN attempts a ON a.attempt_id=?1 WHERE b.run_id=?2 AND b.role=?3 AND b.role_epoch=?4 AND a.state='RUNNING')",params![attempt,run,role,epoch],|r|r.get(0)).map_err(sqlite_error)?;
+    let block = child_id(
+        attempt,
+        &format!("public/{}/{}", part.native_stream, part.block_key),
+    );
+    let mut payload = json!({"block_id":block,"attempt_id":attempt,"run_id":run,"task_id":task,"role":role,"role_epoch":epoch,"session_id":session,"config_revision":revision,"spec_id":spec,"native_stream":part.native_stream,"native_item_id":part.native_item_id,"received_offset":part.received_offset,"part":part.part,"stream":part.stream,"first_offset":part.first_offset,"reason":drop.reason,"dropped_bytes":drop.dropped_bytes,"complete":false,"current":current});
+    for (key, value) in &drop.details {
+        if payload.get(key).is_none() {
+            payload[key] = value.clone();
+        }
+    }
+    let event_id = child_id(
+        attempt,
+        &format!(
+            "public/gap/{}/{}/{}/{}",
+            part.native_stream, part.received_offset, part.native_item_id, part.part
+        ),
+    );
+    let seq = writer::insert_event(
+        &tx,
+        &writer::NewEvent {
+            intent: writer::Intent::Record,
+            project_id: project,
+            run_id: Some(run),
+            event_id,
+            kind: "public.gap".into(),
+            payload,
+        },
+    )?;
+    tx.execute("INSERT INTO public_native_parts(attempt_id,native_stream,native_item_id,part,block_id,received_offset,created_seq) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![attempt,part.native_stream,part.native_item_id,sql_number(part.part)?,block,sql_number(part.received_offset)?,seq]).map_err(sqlite_error)?;
+    writer::commit(tx, ctx)?;
+    Ok(Some(seq))
+}
+
 fn body(
     tx: &Transaction<'_>,
     text: &str,
