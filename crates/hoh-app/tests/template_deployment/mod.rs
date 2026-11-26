@@ -286,7 +286,10 @@ fn audit(trace: &str) -> R<usize> {
             if !CALL_PREFIXES.iter().any(|name| body.starts_with(name)) {
                 return Err(format!("undecodable trace line: {line}").into());
             }
-            if let Some(start) = body.strip_suffix("<unfinished ...>") {
+            if let Some(start) = body
+                .strip_suffix(" <unfinished ...>")
+                .or_else(|| body.strip_suffix("<unfinished ...>"))
+            {
                 if pending.insert(pid, start.to_owned()).is_some() {
                     return Err(format!("overlapping syscalls: {line}").into());
                 }
@@ -930,9 +933,11 @@ fn connect_audit_correlates_interleaved_unfinished_syscalls() -> R {
     let trace = "101 socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_SOCK_DIAG <unfinished ...>\n\
                  102 socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) = 7\n\
                  101 <... socket resumed>) = 7\n\
-                 101 connect(7, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12 <unfinished ...>\n\
+                 101 fcntl(8, F_SETLK <unfinished ...>\n\
                  102 close(7) = 0\n\
-                 101 <... connect resumed>) = 0\n\
+                 101 <... fcntl resumed>, {l_type=F_UNLCK, l_whence=SEEK_SET, l_start=128, l_len=1, l_pid=0}) = 0\n\
+                 101 connect(7 <unfinished ...>\n\
+                 101 <... connect resumed>, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0\n\
                  101 close(7 <unfinished ...>\n\
                  101 <... close resumed>) = 0\n";
     assert_eq!(audit(trace)?, 1);
