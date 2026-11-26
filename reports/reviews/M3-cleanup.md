@@ -584,3 +584,22 @@ shellcheck/bootstrap/bundle/static/build; it was superseded and stopped only whi
 requested `pre-pr-4.log` retains the first attempt and appends the final run, with both identities in `checks.jsonl`.
 
 The reduction cancellation fixture also signals after the 1 MiB threshold, retaining its reduction-path coverage now that the first three reads belong to ordinary framing. The original early-cancel cases remain.
+
+### CR-041 round 2: fix-diff re-review and approval
+
+Scope `62e8d689..0e742bef` (frozen detached copy at `0e742bef`), two complementary fresh sessions:
+
+| Reviewer, session (attempt) | Ids | Verdict |
+|---|---|---|
+| Claude Code 2.1.331, `963b5d08-f566-4fc3-9d61-3664151abb8a` (`93b6fc46-0b6d-45fa-83ce-79328d3de033`): protocol and frame semantics | M3CX-600..699 | PASS: M3CX-001..005 closed (4 of the 5 new frame tests fail on `62e8d689`; differential and drop-and-resume experiments over random chunking show byte-identical output for frames at or under the limit) |
+| Grok 1.0.92, `01a2156e-b53f-7f62-8c08-9e3a5dfbdab5` (`502cfd1c-64c6-48a8-b35d-f582b266e2dd`): concurrency, cancellation, process lifetime | M3CX-700..799 | PASS: M3CX-500 closed; the pipe-read audit is complete (three `read_buf` in frame.rs, two `read` in process.rs) |
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| M3CX-600 | low | Fixed (`M3 cleanup: M3CX-600 the exhausted resume declaration test traces to TEST-024-05`): the M3CX-003 regression is named `test_024_05_*`. |
+| M3CX-601 | low | Fixed with the approval: docs/13 states that only frames proven over 1 MiB enter reduction and smaller frames keep their Line/Partial semantics. |
+| M3CX-700 | medium | Outside the fix diff (docs/19: backlog): `crates/hoh-app/src/host/control.rs` `git_run_limited` joins its blocking stdout reader without a deadline after killing the group; a hook or filter that leaves the group and keeps stdout open would stall the calling thread. M4 low/medium backlog. |
+| M3CX-AUDIT-GIT-DRAIN | low | Same as M3CX-700 (developer's audit note). |
+| M3CX-OUT-001 | — | The developer's scratch pre-pr failed once in `test_029_03` on a strace `???(` line: FLK-15, fixed on `task/M3-flk14-15`; not a frame defect. |
+
+No critical/high in round 2; the lead approved CR-041 under CR-003 D1 and relocked the baseline to revision 30.

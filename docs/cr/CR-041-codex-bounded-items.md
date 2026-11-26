@@ -1,8 +1,8 @@
 # CR-041 · Codex 恢复元数据与有界 item 内容
 
 ID：CR-041
-状态：DRAFT
-批准人：待独立 Review 与 CTO 按 CR-003 D1 审批
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权（两轮各两个互补的独立 Review 会话见审查记录）
 日期：2026-11-25
 关联：M3L-101、M3L-102（high），REQ-024、REQ-027，CR-040
 
@@ -37,3 +37,18 @@ M3L-101：App Server 的 commandExecution.aggregatedOutput / fileChange.changes[
 修改 requirements.json 与 acceptance-scenarios.json，生成 docs/02、docs/18；development-tasks.json 的现有显式 AC 列表补入对应 AC（不推进状态）。docs/13 更新规则。本分支不 relock，CR 保持 DRAFT；仅在本任务创建并登记的 `/home/ai/dev/m3cxfrm-*` scratch 副本中临时 APPROVED、relock 并运行 bundle，记录退出码后删除副本。主分支/其他 worktree 不改。
 
 `bash scripts/dev/pre-pr.sh` 全量前台执行；DRAFT 的本分支 baseline mismatch 如实保留，不通过修改基线消除。完整 scratch 检查和分支检查明确区分。独立 QA/Review 与 CR 批准由指挥安排。
+
+## 是否属于 CR-003 D1
+
+是，理由：(1) 修正规格之间的不一致——REQ-024 要求 Codex 恢复原会话，REQ-027 的 1 MiB 帧上限却使正常的 resume 响应（整个 `Thread.turns`）和正常命令的大输出让 attempt FAILED；(2) 不删除需求或 AC，新增 AC-024-05、AC-027-06；(3) 不放宽门禁、检查或证据规则：1 MiB 上限、AC-027-03/05 及其检查、未知超限帧的失败、缓冲界与原始日志都不变，归约只适用于确切前缀认出的已知 item，截断事实不能让只读判定 PASS，旧 schema 仍为 COMPAT_UNVERIFIED；(4) 不改变 CONTRACT 的架构与交互决定。
+
+## 审查记录
+
+| 轮 | 冻结提交 | 审查者 | 结论 |
+|---|---|---|---|
+| 1 | `62e8d689` | Claude Code 2.1.331（claude-opus-5-5），会话 `6a63d007-c483-4be3-bc7f-34a305d69f80`（attempt `39bdac40-bdab-4f1f-8123-9367edc06772`），编号 M3CX-001..499：协议与帧语义 | PASS；M3CX-001/002 medium，003/005 low，004 文档 |
+| 1 | `62e8d689` | Grok 1.0.92（grok-4.7），会话 `01a214c5-34e5-74f1-9a01-720456c522a8`（attempt `9ce90b73-aaaf-4140-96fd-da8383999765`），编号 M3CX-500..999：并发、取消与进程生命周期 | PASS；M3CX-500 medium（与 M3R-503 同类，先写 DC-M3CX-500） |
+| 2（修复 diff `62e8d689..0e742bef`） | `0e742bef` | Claude Code 2.1.331（claude-opus-5-5），会话 `963b5d08-f566-4fc3-9d61-3664151abb8a`（attempt `93b6fc46-0b6d-45fa-83ce-79328d3de033`），编号 M3CX-600..699 | PASS；M3CX-001..005 关闭；M3CX-600、601 low（已修） |
+| 2（修复 diff `62e8d689..0e742bef`） | `0e742bef` | Grok 1.0.92（grok-4.7），会话 `01a2156e-b53f-7f62-8c08-9e3a5dfbdab5`（attempt `502cfd1c-64c6-48a8-b35d-f582b266e2dd`），编号 M3CX-700..799 | PASS；M3CX-500 关闭；M3CX-700 medium 在修复 diff 之外（既有的 `git_run_limited` 无期限 join），按 docs/19 记入待办 |
+
+全部记录见 `reports/reviews/M3-cleanup.md` 的 CR-041 一节。
