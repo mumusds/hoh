@@ -266,3 +266,278 @@ async fn test_011_05_correlatable_native_user_echo_is_not_duplicated() -> R {
     assert_eq!(diag_source, "native_echo");
     Ok(())
 }
+
+/// Run R (RUNNING) with one developer task T1 READY, its role bound to session `sd`.
+const SESSION_WORLD: &str = "
+INSERT INTO projects(project_id, repo_path, created_at) VALUES ('p1', '/repo', '2026-11-07T00:00:00Z');
+INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES ('R', 'p1', 's1', 'RUNNING', 'AUTO', 1, '2026-11-07T00:00:00Z');
+INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+  ('sd', 'claude', 'developer', '1', '{\"structured_events\": true, \"command_exec\": true}');
+INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+  ('R', 'developer', 'claude', 'sd', 1, 1, '2026-11-07T00:00:00Z');
+INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
+  ('T1', 'R', 's1', 'READY', 1, 'developer', 1, 1);
+";
+
+/// T1 dispatched and RUNNING in session `sd`: its attempt and role epoch.
+async fn running_in_session(store: &Store, now: std::time::SystemTime) -> R<(String, i64)> {
+    let context = crate::decision::Context {
+        required_capabilities: [(
+            "developer".to_owned(),
+            ["structured_events", "command_exec"]
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
+        )]
+        .into(),
+        now: Some(now),
+        ..crate::decision::Context::default()
+    };
+    store.pace_run("R", context.clone()).await?;
+    let attempt = store
+        .schedule_round("R", context)
+        .await?
+        .dispatched
+        .ok_or("T1 not dispatched")?
+        .attempt_id;
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| d.attempt_id == attempt)
+        .ok_or("no notice")?;
+    assert!(store.runner_received(notice, now).await?);
+    assert!(
+        store
+            .runner_running(
+                &attempt,
+                crate::persistence::AttemptFacts {
+                    pid: Some(4242),
+                    ..Default::default()
+                },
+                serde_json::json!({"kind": "proc"}),
+            )
+            .await?
+    );
+    Ok((attempt, 1))
+}
+
+/// DC-M4T09c: every kind of public gap (a native stream left unfinished, a dropped body, an interrupted attempt and
+/// the process-end loss) carries the attempt's identity and is indexed in the session of the attempt's public blocks.
+#[tokio::test]
+async fn test_011_05_every_public_gap_kind_is_indexed_with_its_attempts_session() -> R {
+    use crate::persistence::{Ending, Observed};
+    use crate::public_output::{PublicDrop, PublicEndGap};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join(".hoh/state.db");
+    let store = Store::open(
+        &path,
+        Options {
+            wal_probe: Some(selftest::test_probe(None)),
+            ..Options::new(crate::spawn::Direct::shared())
+        },
+    )?;
+    Connection::open(&path)?.execute_batch(SESSION_WORLD)?;
+    let now = crate::time::parse_rfc3339("2026-11-07T00:00:00Z").ok_or("time")?;
+    let (attempt, epoch) = running_in_session(&store, now).await?;
+    let mut message = part("m1", 0, 0);
+    message.text = "hello\n".into();
+    store.record_public(&attempt, epoch, message).await?;
+    let mut unfinished = part("gap/9/native_stream_unfinished", 0, 2);
+    unfinished.kind = PublicKind::Gap;
+    unfinished.block_key = "gap/9".into();
+    unfinished.received_offset = 9;
+    unfinished.speaker = None;
+    unfinished.text = String::new();
+    unfinished.activity = Some("native_stream_unfinished".into());
+    store.record_public(&attempt, epoch, unfinished).await?;
+    let mut place = part("m2", 6, 1);
+    place.text = String::new();
+    store
+        .record_public_gap(
+            &attempt,
+            epoch,
+            PublicDrop {
+                part: place,
+                dropped_bytes: 7,
+                reason: "public_storage_error".into(),
+                details: serde_json::Map::new(),
+            },
+        )
+        .await?;
+    assert!(
+        store
+            .runner_finished(
+                &attempt,
+                Ending {
+                    success: false,
+                    detail: "FAILED".into(),
+                    class: crate::retry::FailureClass::Transient { retry_after: None },
+                    at: now + std::time::Duration::from_secs(1),
+                    draw: 0,
+                    observed: Observed {
+                        public_end_gap: Some(PublicEndGap {
+                            reason: "public_output_lost".into(),
+                            first_dropped_offset: Some(3),
+                            unrecorded_parts: 1,
+                            dropped_bytes: 4,
+                            ..PublicEndGap::default()
+                        }),
+                        ..Observed::default()
+                    },
+                    unknown_effect: false,
+                },
+            )
+            .await?
+    );
+    while !store.ui_backfill().await?.index_ready {}
+    let conn = Connection::open(&path)?;
+    let session: String = conn.query_row(
+        "SELECT i.session_id FROM events e JOIN ui_event_index i ON i.seq=e.seq WHERE e.kind='public.message' AND i.attempt_id=?1",
+        [&attempt],
+        |r| r.get(0),
+    )?;
+    assert_eq!(session, "sd");
+    let message: serde_json::Value = serde_json::from_str(&conn.query_row(
+        "SELECT payload_json FROM events WHERE kind='public.message'",
+        [],
+        |r| r.get::<_, String>(0),
+    )?)?;
+    let gaps: i64 = conn.query_row(
+        "SELECT count(*) FROM events WHERE kind='public.gap'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(gaps, 4, "one gap of each kind");
+    // An interrupted attempt's gap is named by the state it ended in.
+    let ended: String = conn.query_row(
+        "SELECT state FROM attempts WHERE attempt_id=?1",
+        [&attempt],
+        |r| r.get(0),
+    )?;
+    for reason in [
+        "native_stream_unfinished",
+        "public_storage_error",
+        ended.as_str(),
+        "public_output_lost",
+    ] {
+        let (payload, indexed): (String, Option<String>) = conn
+            .query_row(
+                "SELECT e.payload_json,i.session_id FROM events e LEFT JOIN ui_event_index i ON i.seq=e.seq WHERE e.kind='public.gap' AND json_extract(e.payload_json,'$.reason')=?1",
+                [reason],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| format!("{reason}: {e}"))?;
+        let gap: serde_json::Value = serde_json::from_str(&payload)?;
+        assert_eq!(
+            indexed.as_deref(),
+            Some(session.as_str()),
+            "{reason}: {gap}"
+        );
+        for key in [
+            "attempt_id",
+            "run_id",
+            "task_id",
+            "role",
+            "role_epoch",
+            "session_id",
+            "config_revision",
+            "spec_id",
+        ] {
+            assert_eq!(gap[key], message[key], "{reason} {key}: {gap}");
+        }
+        assert!(gap["block_id"].is_string(), "{reason}: {gap}");
+        assert!(gap["current"].is_boolean(), "{reason}: {gap}");
+        assert_eq!(gap["complete"], false, "{reason}: {gap}");
+    }
+    let end: serde_json::Value = serde_json::from_str(&conn.query_row(
+        "SELECT payload_json FROM events WHERE kind='public.gap' AND json_extract(payload_json,'$.reason')='public_output_lost'",
+        [],
+        |r| r.get::<_, String>(0),
+    )?)?;
+    assert_eq!(end["first_dropped_offset"], 3, "{end}");
+    assert_eq!(end["unrecorded_parts"], 1, "{end}");
+    assert_eq!(end["dropped_bytes"], 4, "{end}");
+    assert_eq!(end["dropped_parts"], 0, "{end}");
+    assert_eq!(end["frames_after_close"], 0, "{end}");
+    assert_eq!(
+        end["current"], false,
+        "an ended attempt's gap is history: {end}"
+    );
+    Ok(())
+}
+
+/// DC-M4T09c source guard: a `public.gap` event is built only by the store's one gap builder, never by a payload
+/// assembled elsewhere (an inline, interrupted, unfinished, process-end or drain-lost gap alike).
+#[test]
+fn test_011_05_public_gap_events_have_one_builder() -> R {
+    fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if path.is_dir() {
+                if name != "tests" {
+                    sources(&path, out)?;
+                }
+            } else if name.ends_with(".rs") && name != "tests.rs" {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("no crates dir")?;
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(crates)? {
+        let src = entry?.path().join("src");
+        if src.is_dir() {
+            sources(&src, &mut files)?;
+        }
+    }
+    assert!(
+        files.len() > 50,
+        "the guard scans the workspace: {}",
+        files.len()
+    );
+    let mut offenders = Vec::new();
+    let mut builder = 0;
+    for file in &files {
+        let text = std::fs::read_to_string(file)?;
+        // An inline test module closes the file; its fixtures are not production payloads.
+        let text = text
+            .find("#[cfg(test)]\nmod tests {")
+            .map_or(text.as_str(), |at| &text[..at]);
+        let rel = file.strip_prefix(crates)?.display().to_string();
+        let named = text.matches("\"public.gap\"").count();
+        let allowed = match rel.as_str() {
+            // The kind's name, and the list of kinds a stopped run still records: neither builds a payload.
+            "hoh-core/src/public_output.rs" | "hoh-core/src/persistence/hold.rs" => 1,
+            _ => 0,
+        };
+        if named != allowed {
+            offenders.push(format!("{rel}: \"public.gap\" x{named}"));
+        }
+        let kinds = text.matches(".event_kind()").count();
+        if rel == "hoh-core/src/persistence/public.rs" {
+            builder = text.matches("PublicKind::Gap.event_kind()").count();
+            // The body path's kind, behind the dispatch that sends a native gap part to the gap builder.
+            if kinds != 2 || !text.contains("if part.kind == PublicKind::Gap {") {
+                offenders.push(format!("{rel}: .event_kind() x{kinds} or no gap dispatch"));
+            }
+        } else if kinds != 0 {
+            offenders.push(format!("{rel}: .event_kind() x{kinds}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "public.gap built outside its builder: {offenders:?}"
+    );
+    assert_eq!(builder, 1, "one gap builder in persistence/public.rs");
+    Ok(())
+}

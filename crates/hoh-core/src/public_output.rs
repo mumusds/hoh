@@ -65,3 +65,15 @@ pub struct PublicDrop {
     pub reason: String,
     pub details: serde_json::Map<String, serde_json::Value>,
 }
+/// The process-end gap of an attempt's public stream: why it ended early and what of it no gap of its own records
+/// (M4T09R-301). The store builds its event, with the attempt's identity, in the attempt's end transaction
+/// (DC-M4T09c).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicEndGap {
+    pub reason: String,
+    pub first_dropped_offset: Option<u64>,
+    pub dropped_parts: u64,
+    pub unrecorded_parts: u64,
+    pub dropped_bytes: u64,
+    pub frames_after_close: u64,
+}

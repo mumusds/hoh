@@ -1,6 +1,9 @@
 //! Public occurrence identities are distinct from reusable content-addressed objects and input delivery.
 use super::{PersistError, sqlite_error, writer};
-use crate::{ids::child_id, public_output::PublicPart};
+use crate::{
+    ids::child_id,
+    public_output::{PublicEndGap, PublicKind, PublicPart},
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -22,6 +25,79 @@ fn digest(text: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// What every public event of an attempt names (DC-M4T09c): the facts [`native`] binds.
+struct Identity {
+    project: String,
+    run: String,
+    task: String,
+    role: String,
+    epoch: Option<i64>,
+    session: Option<String>,
+    revision: i64,
+    spec: Option<String>,
+    /// Whether its role binding is still this attempt's epoch and the attempt is RUNNING.
+    current: bool,
+}
+
+fn identity(tx: &Transaction<'_>, attempt: &str) -> Result<Option<Identity>, PersistError> {
+    let facts:Option<NativeIdentity>=tx.query_row("SELECT r.project_id,t.run_id,t.task_id,t.role,a.role_epoch,a.session_id,a.config_revision,t.spec_id FROM attempts a JOIN tasks t USING(task_id) JOIN runs r USING(run_id) WHERE attempt_id=?1",[attempt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional().map_err(sqlite_error)?;
+    let Some((project, run, task, role, epoch, session, revision, spec)) = facts else {
+        return Ok(None);
+    };
+    let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM role_bindings b JOIN attempts a ON a.attempt_id=?1 WHERE b.run_id=?2 AND b.role=?3 AND b.role_epoch=?4 AND a.state='RUNNING')",params![attempt,run,role,epoch],|r|r.get(0)).map_err(sqlite_error)?;
+    Ok(Some(Identity {
+        project,
+        run,
+        task,
+        role,
+        epoch,
+        session,
+        revision,
+        spec,
+        current,
+    }))
+}
+
+/// The one builder of a `public.gap` event (DC-M4T09c), whatever left the hole: a native stream left unfinished, a
+/// dropped body, an interrupted attempt, or output lost by process end or a lost drain. Every gap carries the
+/// attempt's identity, so a session-filtered view shows it beside the session's blocks; `fields` add what is specific
+/// to the gap and never replace an identity field.
+fn gap(
+    id: &Identity,
+    attempt: &str,
+    key: &str,
+    block: &str,
+    reason: &str,
+    fields: serde_json::Map<String, Value>,
+) -> writer::NewEvent {
+    let mut payload = json!({"block_id":block,"attempt_id":attempt,"run_id":id.run,"task_id":id.task,"role":id.role,"role_epoch":id.epoch,"session_id":id.session,"config_revision":id.revision,"spec_id":id.spec,"current":id.current,"reason":reason,"complete":false});
+    for (name, value) in fields {
+        if payload.get(&name).is_none() {
+            payload[name] = value;
+        }
+    }
+    writer::NewEvent {
+        intent: writer::Intent::Record,
+        project_id: id.project.clone(),
+        run_id: Some(id.run.clone()),
+        event_id: child_id(attempt, key),
+        kind: PublicKind::Gap.event_kind().into(),
+        payload,
+    }
+}
+
+/// Where a native part sits in its stream: a gap in its place names the same.
+fn place(part: &PublicPart) -> serde_json::Map<String, Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("native_stream".into(), json!(part.native_stream));
+    map.insert("native_item_id".into(), json!(part.native_item_id));
+    map.insert("received_offset".into(), json!(part.received_offset));
+    map.insert("part".into(), json!(part.part));
+    map.insert("stream".into(), json!(part.stream));
+    map.insert("first_offset".into(), json!(part.first_offset));
+    map
 }
 
 pub(super) fn accepted(
@@ -90,13 +166,12 @@ pub(super) fn native(
     ctx: &writer::Ctx<'_>,
 ) -> Result<Option<i64>, PersistError> {
     let tx = writer::begin(conn, ctx)?;
-    let facts:Option<NativeIdentity>=tx.query_row("SELECT r.project_id,t.run_id,t.task_id,t.role,a.role_epoch,a.session_id,a.config_revision,t.spec_id FROM attempts a JOIN tasks t USING(task_id) JOIN runs r USING(run_id) WHERE attempt_id=?1",[attempt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional().map_err(sqlite_error)?;
-    let Some((project, run, task, role, actual, session, revision, spec)) = facts else {
+    let Some(id) = identity(&tx, attempt)? else {
         return Err(PersistError::IntegrityViolation(
             "public output has no attempt".into(),
         ));
     };
-    if actual != Some(epoch) || epoch <= 0 {
+    if id.epoch != Some(epoch) || epoch <= 0 {
         return Err(PersistError::IntegrityViolation(
             "public output epoch differs from its attempt".into(),
         ));
@@ -105,7 +180,35 @@ pub(super) fn native(
     if let Some(seq) = prior {
         return Ok(Some(seq));
     }
-    let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM role_bindings b JOIN attempts a ON a.attempt_id=?1 WHERE b.run_id=?2 AND b.role=?3 AND b.role_epoch=?4 AND a.state='RUNNING')",params![attempt,run,role,epoch],|r|r.get(0)).map_err(sqlite_error)?;
+    let block = child_id(
+        attempt,
+        &format!("public/{}/{}", part.native_stream, part.block_key),
+    );
+    let key = format!(
+        "public-part/{}/{}/{}",
+        part.native_stream, part.native_item_id, part.part
+    );
+    // A native gap part (a stream left unfinished) is a gap like any other: built by the one gap builder.
+    if part.kind == PublicKind::Gap {
+        let reason = part.activity.as_deref().unwrap_or("native_gap");
+        let mut fields = place(part);
+        fields.insert("activity".into(), json!(part.activity));
+        let seq = writer::insert_event(&tx, &gap(&id, attempt, &key, &block, reason, fields))?;
+        tx.execute("INSERT INTO public_native_parts(attempt_id,native_stream,native_item_id,part,block_id,received_offset,created_seq) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![attempt,part.native_stream,part.native_item_id,sql_number(part.part)?,block,sql_number(part.received_offset)?,seq]).map_err(sqlite_error)?;
+        writer::commit(tx, ctx)?;
+        return Ok(Some(seq));
+    }
+    let Identity {
+        project,
+        run,
+        task,
+        role,
+        session,
+        revision,
+        spec,
+        current,
+        ..
+    } = id;
     // A native user echo with an accepted input_id links to the existing user block instead of duplicating it (CR-028 §2.2).
     if let Some(input_id) = &part.input_id {
         let existing: Option<(String, i64)> = tx
@@ -192,10 +295,6 @@ pub(super) fn native(
         writer::commit(tx, ctx)?;
         return Ok(Some(seq));
     }
-    let block = child_id(
-        attempt,
-        &format!("public/{}/{}", part.native_stream, part.block_key),
-    );
     let mut payload = json!({"block_id":block,"attempt_id":attempt,"run_id":run,"task_id":task,"role":role,"role_epoch":epoch,"session_id":session,"config_revision":revision,"spec_id":spec,"native_stream":part.native_stream,"native_item_id":part.native_item_id,"received_offset":part.received_offset,"part":part.part,"stream":part.stream,"first_offset":part.first_offset,"speaker":part.speaker,"name":part.name,"activity":part.activity,"model":part.model,"usage":part.usage,"redacted":part.redacted,"complete":part.complete,"current":current,"sha256":digest(&part.text)});
     if let Some(frame_kind) = &part.frame_kind {
         payload["frame_kind"] = json!(frame_kind);
@@ -204,13 +303,7 @@ pub(super) fn native(
         payload["count"] = json!(count);
     }
     let segments = body(&tx, &part.text, &mut payload, ctx, true)?;
-    let event_id = child_id(
-        attempt,
-        &format!(
-            "public-part/{}/{}/{}",
-            part.native_stream, part.native_item_id, part.part
-        ),
-    );
+    let event_id = child_id(attempt, &key);
     // Record semantics preserve a stopped attempt's history without moving its Run or current activity.
     let seq = writer::insert_event(
         &tx,
@@ -249,13 +342,12 @@ pub(super) fn dropped(
 ) -> Result<Option<i64>, PersistError> {
     let part = &drop.part;
     let tx = writer::begin(conn, ctx)?;
-    let facts:Option<NativeIdentity>=tx.query_row("SELECT r.project_id,t.run_id,t.task_id,t.role,a.role_epoch,a.session_id,a.config_revision,t.spec_id FROM attempts a JOIN tasks t USING(task_id) JOIN runs r USING(run_id) WHERE attempt_id=?1",[attempt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional().map_err(sqlite_error)?;
-    let Some((project, run, task, role, actual, session, revision, spec)) = facts else {
+    let Some(id) = identity(&tx, attempt)? else {
         return Err(PersistError::IntegrityViolation(
             "public gap has no attempt".into(),
         ));
     };
-    if actual != Some(epoch) || epoch <= 0 {
+    if id.epoch != Some(epoch) || epoch <= 0 {
         return Err(PersistError::IntegrityViolation(
             "public gap epoch differs from its attempt".into(),
         ));
@@ -264,35 +356,20 @@ pub(super) fn dropped(
     if let Some(seq) = prior {
         return Ok(Some(seq));
     }
-    let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM role_bindings b JOIN attempts a ON a.attempt_id=?1 WHERE b.run_id=?2 AND b.role=?3 AND b.role_epoch=?4 AND a.state='RUNNING')",params![attempt,run,role,epoch],|r|r.get(0)).map_err(sqlite_error)?;
     let block = child_id(
         attempt,
         &format!("public/{}/{}", part.native_stream, part.block_key),
     );
-    let mut payload = json!({"block_id":block,"attempt_id":attempt,"run_id":run,"task_id":task,"role":role,"role_epoch":epoch,"session_id":session,"config_revision":revision,"spec_id":spec,"native_stream":part.native_stream,"native_item_id":part.native_item_id,"received_offset":part.received_offset,"part":part.part,"stream":part.stream,"first_offset":part.first_offset,"reason":drop.reason,"dropped_bytes":drop.dropped_bytes,"complete":false,"current":current});
+    let mut fields = place(part);
+    fields.insert("dropped_bytes".into(), json!(drop.dropped_bytes));
     for (key, value) in &drop.details {
-        if payload.get(key).is_none() {
-            payload[key] = value.clone();
-        }
+        fields.entry(key.clone()).or_insert_with(|| value.clone());
     }
-    let event_id = child_id(
-        attempt,
-        &format!(
-            "public/gap/{}/{}/{}/{}",
-            part.native_stream, part.received_offset, part.native_item_id, part.part
-        ),
+    let key = format!(
+        "public/gap/{}/{}/{}/{}",
+        part.native_stream, part.received_offset, part.native_item_id, part.part
     );
-    let seq = writer::insert_event(
-        &tx,
-        &writer::NewEvent {
-            intent: writer::Intent::Record,
-            project_id: project,
-            run_id: Some(run),
-            event_id,
-            kind: "public.gap".into(),
-            payload,
-        },
-    )?;
+    let seq = writer::insert_event(&tx, &gap(&id, attempt, &key, &block, &drop.reason, fields))?;
     tx.execute("INSERT INTO public_native_parts(attempt_id,native_stream,native_item_id,part,block_id,received_offset,created_seq) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![attempt,part.native_stream,part.native_item_id,sql_number(part.part)?,block,sql_number(part.received_offset)?,seq]).map_err(sqlite_error)?;
     writer::commit(tx, ctx)?;
     Ok(Some(seq))
@@ -411,17 +488,38 @@ pub(super) fn interrupted(
     if !has {
         return Ok(());
     }
-    let (project,run,task,role,epoch,session,revision,spec):NativeIdentity=tx.query_row("SELECT r.project_id,t.run_id,t.task_id,t.role,a.role_epoch,a.session_id,a.config_revision,t.spec_id FROM attempts a JOIN tasks t USING(task_id) JOIN runs r USING(run_id) WHERE attempt_id=?1",[attempt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).map_err(sqlite_error)?;
+    let mut id = identity(tx, attempt)?.ok_or_else(|| {
+        PersistError::IntegrityViolation("interrupted public stream has no attempt".into())
+    })?;
+    id.current = false;
+    let key = "public/interrupted";
+    let block = child_id(attempt, key);
     writer::insert_event(
         tx,
-        &writer::NewEvent {
-            intent: writer::Intent::Record,
-            project_id: project,
-            run_id: Some(run),
-            event_id: child_id(attempt, "public/interrupted"),
-            kind: "public.gap".into(),
-            payload: json!({"block_id":child_id(attempt,"public/interrupted"),"attempt_id":attempt,"task_id":task,"role":role,"role_epoch":epoch,"session_id":session,"config_revision":revision,"spec_id":spec,"reason":reason,"complete":false,"current":false}),
-        },
+        &gap(&id, attempt, key, &block, reason, serde_json::Map::new()),
     )?;
     Ok(())
+}
+
+/// The process-end gap of an attempt's public stream (M4T09R-301), in the transaction of the attempt's end and with
+/// its identity (DC-M4T09c): an ended attempt's gap is history, never current activity.
+pub(super) fn ended(
+    tx: &Transaction<'_>,
+    attempt: &str,
+    end: &PublicEndGap,
+) -> Result<writer::NewEvent, PersistError> {
+    let mut id = identity(tx, attempt)?
+        .ok_or_else(|| PersistError::IntegrityViolation("public end gap has no attempt".into()))?;
+    id.current = false;
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "first_dropped_offset".into(),
+        json!(end.first_dropped_offset),
+    );
+    fields.insert("dropped_parts".into(), json!(end.dropped_parts));
+    fields.insert("unrecorded_parts".into(), json!(end.unrecorded_parts));
+    fields.insert("dropped_bytes".into(), json!(end.dropped_bytes));
+    fields.insert("frames_after_close".into(), json!(end.frames_after_close));
+    let block = child_id(attempt, "public/end");
+    Ok(gap(&id, attempt, "public/gap", &block, &end.reason, fields))
 }
