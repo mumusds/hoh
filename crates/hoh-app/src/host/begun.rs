@@ -419,14 +419,6 @@ mod scan {
             "a method of the same file (a suite's run), whose own spawns are scanned",
         ),
         (
-            "hoh-app/src/host/control.rs",
-            "let reader = std::thread::spawn(",
-            1,
-            "reads a git command's stdout into a buffer (writes nothing); git_run joins it on every path before it \
-             returns, after killing git's process group, so the join waits only for what is already in the pipe \
-             (M2T13R-450)",
-        ),
-        (
             "hoh-core/src/persistence/writer.rs",
             "std::thread::Builder::new()",
             1,
