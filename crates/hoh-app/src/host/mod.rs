@@ -25,6 +25,7 @@ mod inputs;
 mod origin;
 mod processes;
 pub mod product;
+mod public_stream;
 mod reconcile;
 mod runner;
 pub(crate) mod spec;
@@ -643,6 +644,27 @@ impl Host {
                 )));
             })
             .await;
+        // Derived identities are built only after reconcile, one bounded writer request per turn.
+        let indexing = shared.clone();
+        let mut index_stop = stopped.clone();
+        begun.clone().scope(async {
+            served.push(begun::spawn(async move {
+                let mut last: Option<(i64, i64)> = None;
+                loop {
+                    if *index_stop.borrow() { break; }
+                    match indexing.store.ui_backfill().await {
+                        Ok(s) if s.index_ready => break,
+                        Ok(s) => {
+                            let progress = (s.generation, s.indexed_through);
+                            if last == Some(progress) { break; }
+                            last = Some(progress);
+                        }
+                        Err(e) => eprintln!("public identity backfill: {e}"),
+                    }
+                    tokio::select! { _=index_stop.changed()=>{}, _=tokio::time::sleep(std::time::Duration::from_millis(10))=>{} }
+                }
+            }));
+        }).await;
         // Pause and cancel move on with or without an executor (docs/adr/ADR-021.md decision 7).
         served.push(tokio::spawn(begun.clone().scope(control::run(
             shared.clone(),
