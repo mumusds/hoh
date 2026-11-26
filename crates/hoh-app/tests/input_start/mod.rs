@@ -136,12 +136,16 @@ fn input_start_host() -> R {
         if fault == "stage" {
             let mut changes = host.store().watermark();
             tokio::time::timeout(Duration::from_secs(30), async {
-                while host
+                // M3QA-004: wait until T1 is RUNNING (not merely STARTING, which running_attempts() includes) so
+                // under cgroup tracking the steer hits the running turn's Stage path rather than next_attempt.
+                while !host
                     .store()
                     .reader()?
                     .running_attempts("R")?
                     .iter()
-                    .all(|a| a.task_id != "T1")
+                    .any(|a| {
+                        a.task_id == "T1" && a.state == hoh_core::lifecycle::AttemptState::Running
+                    })
                 {
                     changes.changed().await?;
                 }

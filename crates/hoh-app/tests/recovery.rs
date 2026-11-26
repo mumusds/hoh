@@ -953,23 +953,92 @@ fn child(project: &Path) -> R<Command> {
     Ok(command)
 }
 
-/// Wait for `child` to end, at most `limit`; its status and stderr.
+/// Drain whatever bytes are currently ready on a nonblocking stderr pipe.
+fn drain_nonblocking(pipe: &mut Option<std::process::ChildStderr>, buf: &mut Vec<u8>) {
+    use std::io::Read as _;
+    let Some(reader) = pipe.as_mut() else {
+        return;
+    };
+    let mut chunk = [0u8; 4096];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => {
+                *pipe = None;
+                return;
+            }
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                *pipe = None;
+                return;
+            }
+        }
+    }
+}
+
+/// Wait for `child` to end, at most `limit`; its status and stderr. On timeout, kills and reaps the child and keeps
+/// its captured stderr in the error instead of discarding it (M3QA-004).
 fn wait(mut child: ChildGuard, limit: Duration) -> R<(std::process::ExitStatus, String)> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use std::os::fd::AsFd as _;
+    let mut pipe = child.0.stderr.take();
+    if let Some(ref p) = pipe
+        && let Ok(flags) = fcntl_getfl(p.as_fd())
+    {
+        let _ = fcntl_setfl(p.as_fd(), flags | OFlags::NONBLOCK);
+    }
+    let mut buf = Vec::new();
     let end = Instant::now() + limit;
     loop {
+        drain_nonblocking(&mut pipe, &mut buf);
         if let Some(status) = child.0.try_wait()? {
-            let mut stderr = String::new();
-            if let Some(mut pipe) = child.0.stderr.take() {
-                use std::io::Read as _;
-                let _ = pipe.read_to_string(&mut stderr);
+            let drain_end = Instant::now() + Duration::from_millis(500);
+            while pipe.is_some() && Instant::now() < drain_end {
+                drain_nonblocking(&mut pipe, &mut buf);
+                if pipe.is_some() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
-            return Ok((status, stderr));
+            return Ok((status, String::from_utf8_lossy(&buf).into_owned()));
         }
         if Instant::now() > end {
-            return Err("the host process did not end in time".into());
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+            let drain_end = Instant::now() + Duration::from_millis(200);
+            while pipe.is_some() && Instant::now() < drain_end {
+                drain_nonblocking(&mut pipe, &mut buf);
+                if pipe.is_some() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let stderr = String::from_utf8_lossy(&buf);
+            return Err(format!("the host process did not end in time; stderr:\n{stderr}").into());
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn wait_preserves_child_stderr_on_timeout() -> R {
+    let child = Command::new("sh")
+        .args(["-c", "echo m3qa004-timeout-marker >&2; exec sleep 10"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let err = wait(ChildGuard(child), Duration::from_millis(250))
+        .expect_err("sleeping child must time out");
+    let text = err.to_string();
+    assert!(
+        text.contains("the host process did not end in time"),
+        "{text}"
+    );
+    assert!(
+        text.contains("m3qa004-timeout-marker"),
+        "timeout error must retain child stderr: {text}"
+    );
+    Ok(())
 }
 
 /// The pid in the project's host.json, if there is one (a host killed by SIGKILL leaves its file behind).
