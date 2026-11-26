@@ -853,6 +853,61 @@ every request behind it past its deadline, which is what DC-FLK14b removed. Comm
 change (503 in 5 to 6 s, 202 within 5 s, GETs within 500 ms, PRAGMA busy_timeout 5000). Residual, accepted: an outside
 lock held longer than that still ends the attempt as before, now after 15 s instead of 5 s.
 
+#### FLK-14-P1 review round 1: fixes (M3F-001, M3F-100, M3F-101) and deferrals
+
+Review of head "M3 cleanup: FLK-14 record, red and green of DC-FLK14b and FLK-14-F1" by Pi (writer path, M3F-001..005)
+and agy (tests, M3F-100, M3F-101); findings `.hoh-dev/self-tests/flk14p1/review1-findings.json`. No critical or high.
+
+M3F-001 audit against the addendum's rule (Explore subagent with file:line evidence, spot-checked: runner.rs
+`inactivity`, inputs.rs `delivery_error`, requests.rs `answer_message`/`rejected_message`, completion.rs, control.rs
+`recorded_end`). "Lasting" = now made through `Store::lasting`:
+
+| Caller (file) | Records | Process | One DB_BUSY before | Now |
+|---|---|---|---|---|
+| runner.rs `attempt`: `runner_received`, drafting prepare, start failures' `runner_finished`, `runner_running_with` | dispatch taken, its start | not running (gate shut) | `runner_error` settle, redispatched; nothing done is lost | unchanged |
+| runner.rs `serve_request` → requests.rs `answer_message` / `answer_work` (consult, route, refusal diagnostic) | a request the agent made | running | the attempt ends `runner_error`, the live agent is stopped, UNKNOWN_EFFECT | lasting (whole answer; a committed request replays its reply) |
+| runner.rs `run_check` `refused` | a refused check | running | same | lasting |
+| check.rs `record_evidence` (via `run_check`) | a check that ran | running | the answer says error; pending facts on disk are recorded later | unchanged (nothing lost) |
+| runner.rs `inactivity` → `runner_watched` | a watchdog look | running | logged, the next look records it | unchanged |
+| runner.rs `runner_effect` STARTED→OBSERVED | the result (a Commander's outputs too) | ended | UNKNOWN_EFFECT, result dropped (reproduced) | lasting |
+| runner.rs `runner.unreaped` / `runner.outside` commits | stop steps | ended | `runner_error` settle | lasting |
+| runner.rs `runner_effect` OBSERVED→COMMITTED | none new | ended | settle; a verifier's or spec review's report lost | lasting |
+| runner.rs `answer_bridge_messages` | messages left in the bridge | ended | settle answers them again; a verifier's report lost | lasting |
+| completion.rs `complete` → `complete_writer_attempt` | a writer's completion | ended | recovered by a reconcile, its end's detail and events lost | lasting (store request only; the outcome is not computed again) |
+| completion.rs `complete_verifier` → `complete_verifier_attempt` | a verifier's report | ended | verified again (`recover` has no reporting) | lasting |
+| runner.rs `finish_spec_review` | a review's report and native record | ended | reviewed again (`ended_without_report`) | lasting |
+| runner.rs final `runner_finished` (via `recorded_end`) | the end, workspace record | ended | settle from the effect state, its detail lost | lasting |
+| runner.rs `settle` commits / `reconcile_apply` / `recover` | disposition | ended | redone at the lease's expiry | unchanged (`recover`'s completion writes are lasting through `complete`/`complete_verifier`) |
+| inputs.rs steer `route_input` Finish | the outcome of a steer the agent was handed | running | row back to PENDING, the next Stage rejects it UNKNOWN_DELIVERY | lasting |
+| inputs.rs / delivery.rs consumes and `settle_outbox` | the receipt is the write itself | n/a | redelivered (M3F-002 counts one attempt) | unchanged |
+| verifying.rs `record_attempt_change`, reconcile tree check | tree evidence | ended | logged / next reconcile | unchanged |
+| Commander decisions | recorded with the Commander's OBSERVED (row above); every other decision path is a tick job or a command | | | via OBSERVED |
+
+Red first: `test_062_01_an_attempts_end_outlasts_an_outside_write_lock` (crates/hoh-app/tests/retry.rs, busy timeout
+1 s): a hook takes an outside write lock at the attempt's AfterEffectStarted and releases it only at the first
+`RetryingBusy` (the new runner point fired before a lasting write goes again) or, on code without the retry, at the
+attempt's error settle (`Settling`); no sleep decides the order. On the commit "M3F-001 red" (test and point, no retry):
+`hoh host: an attempt of the runner: DB_BUSY: database is locked`, the attempt `UNKNOWN_EFFECT`, effect `UNKNOWN`, hooks
+`[locked, Settling, released]`, exit 101 (`fix1-red-runner.log`). Green: effect COMMITTED, attempt SETTLED, Td
+IMPLEMENTED with one attempt, hooks `[locked, RetryingBusy, released]` (`fix1-green-runner.log`, then 5/5 in a row,
+`fix1-green-runner-repeat-*.log`). hoh-core: `test_062_01_a_lasting_write_outlasts_an_outside_lock_for_two_more_busy_timeouts`
+(released at its first retry it commits; never released it answers DB_BUSY 2 busy timeouts after its first one, nothing
+written) with the existing queued-write test (`fix1-green-core.log`). AC-062-01's host tests unchanged and green
+(`fix1-green-host.log`: 503 in 5 to 6 s, 202 within 5 s, GETs within 500 ms, PRAGMA 5000).
+
+| Finding | Severity | Disposition | Evidence |
+|---|---|---|---|
+| M3F-001 | medium | fixed: DC-FLK14b addendum (above), `Store::lasting` + `RunnerPoint::RetryingBusy`, applied per the audit table; red then green | commits "M3F-001 red …", "M3F-001 a write that records an attempt's work goes again …"; `fix1-red-runner.log`, `fix1-green-runner*.log`, `fix1-green-core.log`, `fix1-green-host.log` |
+| M3F-002 | low | deferred (low package): a delivery's DB_BUSY counts one delivery attempt (`delivery_error` → Lost); nothing is lost, the row is redelivered; fix direction: a retryable Busy not counted | review1-findings.json |
+| M3F-003 | low | deferred (low package): an urgent job's lock wait is not capped by the normal lane's head deadline, so while a cancel waits for a held lock earlier normal requests answer late (as before DC-FLK14b; AC-062-01 covers the idle host) | review1-findings.json |
+| M3F-004 | low | deferred (low package): the deadline is per job, so a later transaction of a multi-transaction job longer than busy_timeout has no lock wait; no such job found on the regular paths | review1-findings.json |
+| M3F-005 | low | no action: the reviewer's process note (a 37-byte file created and removed under the frozen copy's ignored `.hoh-dev/`; tracked content unchanged) | review1-findings.json |
+| M3F-100 | low | fixed: the vector is `netlink.replace(") = 0", " <unfinished ...>")`, and the same unfinished connect on an owned SOCK_DIAG socket gives `Ok(1)`, so the negative fails on its authorization | commit "M3F-100 …"; `fix1-green-audit.log` |
+| M3F-101 | low | fixed: `OutsideLock` (host.rs) and `Holder` (claude_adapter.rs) release and reap their child on drop, like `WriteLock` in tui_pty.rs; no assertion changed | commit "M3F-101 …"; `fix1-green-host.log`, `fix1-green-adapter.log` |
+
+Evidence under `.hoh-dev/self-tests/flk14p1/fix1-*` (test binaries run under the test slot from copies taken at each
+commit, digests in `fix1-binaries.sha256`). Self-tests, not acceptance.
+
 ## FLK-15 (strace's `???` for a call it could not read)
 
 Developer diagnostics from `072f9fa6`, REQ-029 / AC-029-03 (CR-037), test
