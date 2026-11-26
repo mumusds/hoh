@@ -821,6 +821,38 @@ release it right after `cancel.request()` (`f1-claude-adapter.log`). No assertio
 
 Evidence under `.hoh-dev/self-tests/flk14p1/`. Self-tests, not acceptance.
 
+#### DC-FLK14b addendum (review round 1, M3F-001: what a write that records work already done does with DB_BUSY)
+
+Wrong assumption in "Consequences, accepted": every caller of a write that now sees `DB_BUSY` earlier loses nothing
+because it is retried (a command's 503, the next tick, the next poll). Writes that record what an agent's process
+already did are not redone with the same data: one `DB_BUSY` ends the attempt (`?` up to `runner.rs` `attempt`'s
+`settle(runner_error)`), and an attempt whose work effect is still STARTED is disposed UNKNOWN_EFFECT, its result
+dropped. Chain (review, reproduced by the test below): an outside connection holds the write lock (AC-062-01's 7 s hold)
+→ the idle input sweep waits for it on the writer → an attempt's process ends and its `runner_effect` STARTED→OBSERVED is
+queued behind the sweep → with the lock wait counted from submission it fails DB_BUSY one busy timeout after it was
+submitted, where before it waited behind the sweep and then had a busy timeout of its own → `settle(runner_error)` →
+UNKNOWN_EFFECT. (A lock held longer than one busy timeout from the write's start lost it before DC-FLK14b too.)
+
+Who sees DB_BUSY earlier: every request queued behind a lock waiter. Who must not lose work (audit by an Explore
+subagent with file:line evidence, spot-checked; the table is in the fix section below): an attempt's writes from its
+process's start to its end's commit that record what the process did or asked (a request's answer, a refused check,
+its result OBSERVED, its stop steps, COMMITTED, a writer's, verifier's or spec review's completion, its end), and a
+steer's outcome after the agent was handed it. Not in that class: commands (a retryable 503, AC-062-01), every tick
+and poll job (redone next time from the database), an attempt's writes before its process runs (nothing done yet; its
+`runner_error` settle re-dispatches), delivery consumes (the receipt is the write; redelivered), the settles (redone at
+the lease's expiry).
+
+Rule adopted: such a write is made through `Store::lasting`: on `DB_BUSY` its caller makes it again, each time a new
+request at the end of the writer's queue with a lock wait of its own (so whatever is queued behind it keeps DC-FLK14b's
+deadline), until `LASTING_BUSY_TIMEOUTS` = 2 busy timeouts have passed since its first `DB_BUSY`; then that `DB_BUSY`
+goes up as before. It therefore outlasts an outside write lock that ends within three busy timeouts (15 s at 5000 ms)
+of its first submission, AC-062-01's 7 s hold from any submission point. Only `DB_BUSY` is retried (`DB_FULL` is not a
+lock and does not pass by waiting); a `DB_BUSY` writes nothing, so making it again is safe, and what the callers
+compute before the write is not redone (only the store request is). Not in the writer thread: a retry there would hold
+every request behind it past its deadline, which is what DC-FLK14b removed. Commands and the AC-062-01 windows do not
+change (503 in 5 to 6 s, 202 within 5 s, GETs within 500 ms, PRAGMA busy_timeout 5000). Residual, accepted: an outside
+lock held longer than that still ends the attempt as before, now after 15 s instead of 5 s.
+
 ## FLK-15 (strace's `???` for a call it could not read)
 
 Developer diagnostics from `072f9fa6`, REQ-029 / AC-029-03 (CR-037), test
