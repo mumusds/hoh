@@ -239,14 +239,7 @@ async fn test_032_04_scenarios_from_spec_not_contracts() -> R {
         use std::os::unix::process::CommandExt as _;
         pty::Hoh(
             std::process::Command::new(strace_bin)
-                .args([
-                    "-f",
-                    "-e",
-                    "trace=open,openat,openat2,stat,newfstatat,statx,access,faccessat,faccessat2",
-                    "-s",
-                    "4096",
-                    "-o",
-                ])
+                .args(["-f", "-e", "trace=%file", "-s", "4096", "-o"])
                 .arg(&strace_log)
                 .arg(world::HOH)
                 .arg("__host")
@@ -259,13 +252,22 @@ async fn test_032_04_scenarios_from_spec_not_contracts() -> R {
                 .spawn()?,
         )
     };
+    let own_pid = i32::try_from(std::process::id())?;
     let host_json_path = world.project().join(".hoh/host.json");
     let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let (port, token, host_pid): (u16, String, i32) = loop {
+        if let Some(status) = tracer.0.try_wait()? {
+            return Err(format!(
+                "strace exited before host became ready ({status}): {}",
+                std::fs::read_to_string(&strace_err).unwrap_or_default()
+            )
+            .into());
+        }
         if let Ok(bytes) = std::fs::read(&host_json_path)
             && let Ok(v) = serde_json::from_slice::<Value>(&bytes)
             && let (Some(port), Some(token), Some(pid)) =
                 (v["port"].as_u64(), v["token"].as_str(), v["pid"].as_u64())
+            && pid != u64::from(std::process::id())
             && std::net::TcpStream::connect(("127.0.0.1", port as u16)).is_ok()
         {
             break (port as u16, token.to_owned(), i32::try_from(pid)?);
@@ -279,6 +281,10 @@ async fn test_032_04_scenarios_from_spec_not_contracts() -> R {
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     };
+    assert_ne!(
+        host_pid, own_pid,
+        "host.json must name the traced child host, not this test process"
+    );
     let trace: Value = tokio::task::spawn_blocking(move || -> Result<Value, String> {
         use std::io::{Read as _, Write as _};
         let mut stream =
@@ -302,11 +308,25 @@ async fn test_032_04_scenarios_from_spec_not_contracts() -> R {
     })
     .await?
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    let _ = rustix::process::kill_process(
-        rustix::process::Pid::from_raw(host_pid).ok_or("host pid")?,
-        rustix::process::Signal::TERM,
-    );
-    let _ = tracer.0.wait();
+    let host_raw = rustix::process::Pid::from_raw(host_pid).ok_or("host pid")?;
+    let _ = rustix::process::kill_process(host_raw, rustix::process::Signal::TERM);
+    let term_end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if tracer.0.try_wait()?.is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= term_end {
+            if let Ok(raw) = i32::try_from(tracer.0.id())
+                && let Some(pgid) = rustix::process::Pid::from_raw(raw)
+            {
+                let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+            }
+            let _ = rustix::process::kill_process(host_raw, rustix::process::Signal::KILL);
+            let _ = tracer.0.wait();
+            return Err("traced hoh __host did not exit after SIGTERM within 15s".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     let traced_calls = std::fs::read_to_string(&strace_log)?;
     assert!(
         traced_calls.contains(&index.sha256()),
@@ -316,7 +336,12 @@ async fn test_032_04_scenarios_from_spec_not_contracts() -> R {
     );
     let contracts_hits: Vec<&str> = traced_calls
         .lines()
-        .filter(|line| line.contains(&prefix) || line.contains("\"contracts/"))
+        .filter(|line| {
+            line.contains(&prefix)
+                || line.contains("\"contracts/")
+                || line.contains("\"contracts\"")
+                || line.contains("/contracts\"")
+        })
         .collect();
     assert!(
         contracts_hits.is_empty(),
