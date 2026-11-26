@@ -258,6 +258,9 @@ pub enum RunnerPoint {
     /// decision 6's recovery after OBSERVED).
     AfterEffectObserved,
     AfterEffectCommitted,
+    /// A write that records what its attempt's process already did met a retryable `DB_BUSY` and is submitted again
+    /// (DC-FLK14b addendum, reports/reviews/M3-cleanup.md).
+    RetryingBusy,
 }
 
 /// A host's runner: where its work runs and what its rounds judge by (the roles' required capabilities, the reader

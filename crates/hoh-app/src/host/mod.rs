@@ -230,7 +230,7 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     fn runner(&self, _point: RunnerPoint) {}
 
     /// At `point` of attempt `attempt_id`, one of the points of an attempt the runner runs (BeforeSend, AfterSend,
-    /// AfterAck, AfterSpawn, Settling, AfterEffectStarted, AfterEffectObserved, AfterEffectCommitted):
+    /// AfterAck, AfterSpawn, Settling, AfterEffectStarted, AfterEffectObserved, AfterEffectCommitted, RetryingBusy):
     /// [`HostHooks::runner`], unless a test's implementation selects the attempt (a fault at one attempt's point,
     /// whatever other attempt reaches the point first, such as the Commander's turn a run's adoption of its
     /// specification wakes, docs/adr/ADR-031.md decision 1).
