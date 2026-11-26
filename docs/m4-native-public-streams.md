@@ -58,26 +58,38 @@ thinking/signature、reasoning item、Pi sections/toolsAdded 等不进入公开�
 fsync → rename → 目录 fsync → artifact 登记，才写引用事件。流式文本增量按 CR-028 §2.2
 在 ≤50 ms 或 16 KiB（先到即提交）内合并，工具与块边界立即冲刷；任何后续帧（含未映射帧）先冲刷已到期的合并文本。
 
-流式去敏（DC-M4T09b）：每个块中最后一个换行之后的字节不发布，直到换行到达、块结束（完成帧、进程结束、取消或放弃），
-或这段未结束的尾部达到 16 KiB。因此工具边界、不可合并帧和 50 ms 定时器只冲刷到最后一个换行为止。
-整行与结束时的尾部都经过批量路径同一个 `redact` 函数，所以无论增量如何切分、何时冲刷，
-同一块发布正文的拼接都等于对全文的批量去敏结果，跨模式输出一致；每个公开段的 `redacted`
-当且仅当该段含去敏内容时为 true。上限：单行超过 16 KiB 时尾部按一个单元去敏后发布，
-并保留其末尾 13 字节用于识别跨越上限的关键词；若关键词在同一行中比凭证晚出现超过 16 KiB，
-关键词之前已发布的部分无法收回。块只保留未结束的尾部、已接收长度与摘要，不保留全文。
+流式去敏（DC-M4T09b）：每个块中最后一个换行之后的字节不发布，直到换行到达或块结束（完成帧、进程结束、取消或放弃）。
+因此工具边界、不可合并帧和 50 ms 定时器只冲刷到最后一个换行为止。
+整行与结束时的尾部都经过批量路径同一个 `redact` 函数，所以只要每行（含换行）短于 32 KiB，无论增量如何切分、何时冲刷，
+同一块发布正文的拼接都等于对全文的批量去敏结果，跨模式输出一致。
+长行（M4T09R-400）：未结束的一行积累到 16 KiB 加保留窗口 W = 16 KiB（共 32 KiB）时，只发布比最后 W 字节更早的部分，
+最后 W 字节继续保留；每次关键词检查都包含整个保留窗口。确切上界：行结束之前，一个字节只有在它之后至少已有 W 字节
+无关键词的同行文本时才会提前发布，所以凭证之后 W（16384）字节内结束的关键词总能让它被去敏；只有比关键词结尾早超过
+W 字节的部分可能已经原样发布，无法收回，该行其余部分（保留窗口和后续字节）替换为 `[redacted]`。
+若关键词在提前发布之前就已出现，整行只发一个 `[redacted]`，其余字节直到换行都不发布。
+`redacted` 表示该段被去敏改写过，即该段带有去敏引入的 `[redacted]` 标记；标记所代替的字节即使在之后的段才到达也不再发布，
+这些段不因此标记；被去敏行的换行按原样发布，不标记。块只保留未结束的尾部（少于 32 KiB 加一次推送的长度）、
+已接收长度与摘要，不保留全文。
+时间线次序（M4T09R-505，留给 T05/T06 渲染）：没有换行的增量之后紧跟工具边界时，被保留的文本在工具事件之后才发布；
+块正文与偏移正确，但文本与工具在事件序列中的先后可能与原生顺序、批量模式不同。渲染时同一块的文本按
+`block_id`/`first_offset` 归并，不按事件 seq 推断文本与工具的相对位置。
 段的出现身份是 `(block_id, stream, first_offset)`，相同内容可复用一个 artifact。接收队列为 64 项，
 包括持久化中的正文总配额为 1 MiB；仅 `DB_BUSY` 触发背压重试与本地阻塞计时，
 `StorageLowSpace`、`DB_FULL`（状态库已满）及其它写入错误都丢弃该正文并继续运行，不让存储拖住 agent。
-被丢弃的正文由一条内联 `public.gap` 占据它的位置：它与 `public.message` 绑定相同的 attempt、task、role、
-role_epoch、session、config_revision、spec 与 current，并带 `stream`、`first_offset`、`received_offset`、
-`dropped_bytes` 与原因，会话筛选的 Focus 能看到它。gap 本身最多尝试 3 次（间隔 50 ms、100 ms，合计远小于一个 quiet 周期），
+被丢弃的正文由一条内联 `public.gap` 占据它的位置，并带 `stream`、`first_offset`、`received_offset`、
+`dropped_bytes` 与原因。所有 `public.gap`（内联丢弃、原生流未完成 `native_stream_unfinished`、Attempt 中断、
+进程结束的丢失与排水丢失）都由持久化层的同一个构造函数生成（DC-M4T09c）：它与 `public.message` 绑定相同的
+attempt、run、task、role、role_epoch、session、config_revision、spec 与 current，并带 `reason` 与 `complete=false`；
+进程结束的 gap 在 Attempt 结束事务里生成，current 为 false。因此每种 gap 在 `ui_event_index` 中都与该 Attempt 的公开块
+同一 session，会话筛选的 Focus 能看到它。源码守卫测试禁止在别处构造 `public.gap`。gap 本身最多尝试 3 次（间隔 50 ms、100 ms，合计远小于一个 quiet 周期），
 所以 gap 可能比后续正文晚一些出现；仍写不进时，这次丢失被计数，并写进进程结束时的 `public.gap`
 （`reason=public_output_lost`，带 `first_dropped_offset`、`unrecorded_parts`、`dropped_bytes`）。
 诊断失败不终止排水，排水消失时原生 stdout 读取与取消继续可达，此后未发布的帧数同样计入结束 gap。
 只有 inactivity 暂停 `DB_BUSY` 本地阻塞时间，已累计的 quiet 时间保留；进程结束、取消、期限和预算继续推进。
 进程结束后最多等待公开队列一秒，未完成则在原结束事务中写 gap，并附上排队未写的部分；恢复也保留已提交正文并写 gap。
 读取被放弃时不再等待：已合并和被保留的文本（按上述规则去敏）与 `native_stream_unfinished` gap 以不阻塞方式送入队列，
-放不下的部分计入结束 gap。
+放不下的部分计入结束 gap；放弃时尚未送入队列就被取消的一批（M4T09R-501）同样计入。丢失账本依赖单一发布者：
+每个队列只有 stdout 读取任务发布、只有一个排水任务按队列顺序结算（M4T09R-504）。
 适配器原有帧大小限制继续生效，超限、截断或缩减的帧明确写 gap，不能标为完整文本。
 
 SendInput 在原接受事务中按 input_id 保存 CR/LF 规范化的原文，文件投递提示不能替代它。
