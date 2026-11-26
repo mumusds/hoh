@@ -573,3 +573,14 @@ regression found a redundant yield and was corrected; the first threshold implem
 work bound and rescanned earlier bytes, so it was superseded by bounded buffered processing and incremental LF search.
 Its exact registered test process was stopped; `fix1-stopped-superseded-test.json` records identity. No gate, AC or check
 plan was changed. Final scratch-only approval/relock, full pre-pr and candidate-4 evidence accompany the handoff.
+
+Supplemental M3CX-001 check before candidate-4: the delayed-reduction transfer must diagnose every already-read
+byte of the refused frame, including input not yet moved through the reducer when its structure budget fails.
+`fix1-001-diagnostic-red.log` reproduces length 528,384 instead of 1,048,577. The fix consumes the remaining buffered
+current-frame bytes into the diagnostic hash/length, stopping at LF and respecting CRLF. `fix1-001-diagnostic-green.log`
+runs the complete frame regression, including the new length/hash/head assertion. The first scratch pre-pr passed
+shellcheck/bootstrap/bundle/static/build; it was superseded and stopped only while waiting for the workspace slot
+(recorded PID/start plus exact flock child). The final source receives the full pre-pr in `pre-pr-4-final.log`; the
+requested `pre-pr-4.log` retains the first attempt and appends the final run, with both identities in `checks.jsonl`.
+
+The reduction cancellation fixture also signals after the 1 MiB threshold, retaining its reduction-path coverage now that the first three reads belong to ordinary framing. The original early-cancel cases remain.

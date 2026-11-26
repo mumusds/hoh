@@ -137,7 +137,8 @@ async fn test_027_06_m3r503_reduce_observes_cancel_within_one_read() -> R {
         b"\n".to_vec(),
     ]
     .concat();
-    for signal_at in [0, 3] {
+    // Also cancel after the normal-frame threshold, inside streaming reduction.
+    for signal_at in [0, 3, FRAME_LIMIT / READ_CHUNK + 3] {
         let (reader, reads, stop) = reader(input.clone(), signal_at);
         cancel(reader.reducing(reduce_rule()), reads, stop, signal_at).await?;
     }
