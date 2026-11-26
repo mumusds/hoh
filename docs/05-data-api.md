@@ -66,7 +66,7 @@ cursor绑定Run/query（含limit）/H/generation，错配为404 BAD_REQUEST。�
 next_cursor=null、watermark=H，末页next_cursor=null。AC-064-01逐项核对。
 不新增输入命令或投递循环。该扩展由 T03 交付，T02 消费，旧路由与错误语义保持。
 
-ui.task在同一H的RUNNING Task中，排序时间仅取该Task于H唯一RUNNING Attempt的attempts.started_at（runner接收派发、进入STARTING时持久化的启动事实）；重试使用当前新Attempt，忽略已结束历史Attempt，不用Task创建时间/首次启动/客户端时钟替代。按解析后的UTC时刻降序、同时间按task_id升序；无唯一RUNNING Attempt或started_at缺失/不可解析时排序值为unknown，排在已知时间之后，unknown之间仍按task_id升序并保留缺失诊断，不借旧Attempt补值。没有RUNNING Task时ui.task=null；其它Task仍由tasks路由可查。决策依据取公开 basis/reason/note，
+ui.task在同一H的RUNNING Task中，排序时间仅取该Task于H唯一RUNNING Attempt的attempts.started_at（runner接收派发、进入STARTING时持久化的启动事实）；重试使用当前新Attempt，忽略已结束历史Attempt，不用Task创建时间/首次启动/客户端时钟替代。按解析后的UTC时刻降序、同时间按task_id升序；无唯一RUNNING Attempt或started_at缺失/不可解析时排序值为unknown，排在已知时间之后，unknown之间仍按task_id升序，不借旧Attempt补值。没有RUNNING Task时ui.task=null；其它Task仍由tasks路由可查。决策依据取公开 basis/reason/note，
 影响取已提交 effects，分别带来源；缺失显示 unknown 且不计 PASS。T02 经 refinement CR
 以加法可选协议字段补齐缺失类别的真实生产者，fixture 不捏造依据或影响。
 T02 先交付小屏显示与自身其余 AC；T06 写者在共享 progress 交付后补齐并执行

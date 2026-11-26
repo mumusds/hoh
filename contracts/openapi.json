@@ -1408,7 +1408,7 @@
           "task_id",
           "phase"
         ],
-        "description": "CR-028 C3 / M4A-002: at snapshot H, consider this Run's RUNNING tasks. The ordering timestamp is attempts.started_at of that Task's unique current RUNNING Attempt at H: the persisted start fact recorded when the runner accepts dispatch and moves it to STARTING. A retry uses the new Attempt, never a finished historical Attempt, Task creation time, first-ever start or client time. Compare parsed UTC instants descending, then task_id ascending. Missing/unparseable started_at or no unique RUNNING Attempt yields unknown ordering time plus a diagnostic; unknowns sort after known times and among themselves by task_id ascending. With no RUNNING Task, ui.task is null. All other tasks remain queryable through the existing tasks route. Reconstruct facts at H, never substitute later mutable state."
+        "description": "CR-028 C3 / M4A-002: at snapshot H, consider this Run's RUNNING tasks. The ordering timestamp is attempts.started_at of that Task's unique current RUNNING Attempt at H: the persisted start fact recorded when the runner accepts dispatch and moves it to STARTING. A retry uses the new Attempt, never a finished historical Attempt, Task creation time, first-ever start or client time. Compare parsed UTC instants descending, then task_id ascending. Missing/unparseable started_at or no unique RUNNING Attempt yields unknown ordering time; unknowns sort after known times and among themselves by task_id ascending. With no RUNNING Task, ui.task is null. All other tasks remain queryable through the existing tasks route. Reconstruct facts at H, never substitute later mutable state."
       },
       "InputStatePageRef": {
         "type": "object",
