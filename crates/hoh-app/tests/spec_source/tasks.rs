@@ -877,8 +877,11 @@ async fn test_033_04_plan_import_pairs_replacements_per_run() -> R {
 
 /// M3QA-019 (AC-033-04 / fault matrix G4): the product itself places a writer Task into SPEC_MISMATCH hold
 /// (`completion.rs:672-677` WorkReason::SpecMismatch) when the specification advances before its rev-1 freeze
-/// completes, and refuses dispatch of an old-spec Task (`admission.rs:283` Refusal::SpecMismatch); then the
-/// subsequent approval releases & migrates T1 (REQ-A) and cancels T2 (REQ-C, replaced by T3).
+/// completes; then the subsequent approval releases & migrates T1 (REQ-A) and cancels T2 (REQ-C, replaced by T3),
+/// leaving T2 bound to rev 2 while the run advances to rev 3 so direct attempt creation (`attempts.rs:395`) directly
+/// hits `admission.rs:283` (`Refusal::SpecMismatch`). (In `schedule_round`, `candidates()` and `admit()` share one
+/// IMMEDIATE transaction where `Eligibility.current_spec` already excludes stale-spec rows; in `decide`,
+/// `decision.rs:668` checks `task.spec_id != run.spec_id` first.)
 #[tokio::test]
 async fn test_033_04_product_places_writer_in_spec_mismatch_hold_then_approval_migrates_or_cancels()
 -> R {
@@ -1034,17 +1037,6 @@ async fn test_033_04_product_places_writer_in_spec_mismatch_hold_then_approval_m
             ))?.contains("specification"),
             "need_decision must record the spec mismatch detail"
         );
-        // Exercise admission.rs:283 Refusal::SpecMismatch: a READY task still bound to revision 1 is refused by schedule_round on revision 2.
-        world.exec(&format!(
-            "INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) \
-             VALUES('stale-rev1','{run}','{rev1_spec}','READY','developer',1,99);"
-        ))?;
-        let refused_round = host.store().schedule_round(&run, context()).await?;
-        assert!(
-            refused_round.dispatched.is_none(),
-            "admission must refuse stale-spec task: {refused_round:?}"
-        );
-        world.exec("DELETE FROM tasks WHERE task_id='stale-rev1';")?;
         // Revision 3 rewrites REQ-A and deletes REQ-C: product releases T1 to READY (migrated) or cancels T2 (replaced by T3).
         let rev3 = remove_c(&world)?;
         submit_spec(&host, &run, "rev3-propose", "ProposeSpecChange", &rev3).await?;
@@ -1090,6 +1082,55 @@ async fn test_033_04_product_places_writer_in_spec_mismatch_hold_then_approval_m
                     "SELECT state FROM tasks WHERE task_id='{task_id}'"
                 ))?,
                 "CANCELLED"
+            );
+            assert_eq!(
+                world.query(&format!(
+                    "SELECT spec_id FROM tasks WHERE task_id='{task_id}'"
+                ))?,
+                rev2_spec,
+                "cancelled {task_id} keeps its pre-deletion rev-2 spec_id while the run is on rev 3"
+            );
+            // Directly observe admission.rs:283 Refusal::SpecMismatch on the product-cancelled T2 (no SQL seeding):
+            // attempts::create (`By::Direct`) has no prior spec_id or CANCELLED guard, so only Refusal::SpecMismatch
+            // rejects this call and keeps T2's attempt count at 1.
+            let attempts_before = world.query(&format!(
+                "SELECT count(*) FROM attempts WHERE task_id='{task_id}'"
+            ))?;
+            let direct = host
+                .store()
+                .create_attempt(hoh_core::persistence::NewAttempt {
+                    attempt_id: "t2-stale-spec-direct".to_owned(),
+                    task_id: task_id.to_owned(),
+                    session_id: None,
+                    role_epoch: 1,
+                    host_epoch: 1,
+                    config_revision: 1,
+                    agent: Some("claude".to_owned()),
+                })
+                .await;
+            let expected_why = format!(
+                "{task_id} belongs to specification Some(\"{rev2_spec}\") but the run's is Some(\"{rev3_spec}\")"
+            );
+            assert!(
+                matches!(
+                    direct,
+                    Err(hoh_core::persistence::PersistError::IllegalTransition {
+                        ref id,
+                        ref from,
+                        ref to,
+                        ref why,
+                        details: None,
+                        ..
+                    }) if id == task_id && from == "CANCELLED" && to == "LEASED" && why == &expected_why
+                ),
+                "admission.rs Refusal::SpecMismatch must refuse direct attempt creation on stale-spec {task_id}: {direct:?}"
+            );
+            assert_eq!(
+                world.query(&format!(
+                    "SELECT count(*) FROM attempts WHERE task_id='{task_id}'"
+                ))?,
+                attempts_before,
+                "refused stale-spec attempt creation must write no attempt row"
             );
             let replanned = decide(
                 &world,

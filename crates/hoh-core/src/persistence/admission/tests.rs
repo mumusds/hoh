@@ -674,3 +674,45 @@ fn test_009_02_m3l103_only_own_active_draft_holds_product_writes() -> R {
     );
     Ok(())
 }
+
+/// M4L2-001: `admission::admit_one` directly returns `Refusal::SpecMismatch` on every caller path when a task's
+/// `spec_id` differs from the run's current specification (or belongs to another run).
+#[test]
+fn admit_refuses_stale_spec_task_for_every_caller() -> R {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    super::super::migrate(&conn, super::super::MIGRATIONS)?;
+    conn.execute_batch(
+        "INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/repo','now');
+         INSERT INTO specs VALUES('s1','p',printf('%064d',1),1),('s2','p',printf('%064d',2),2);
+         INSERT INTO runs(run_id,project_id,spec_id,state,mode,created_at) VALUES
+           ('r','p','s2','RUNNING','AUTO','now'),('other','p','s2','RUNNING','AUTO','now');
+         INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES
+           ('stale','r','s1','READY','developer',1,1),
+           ('foreign','other','s2','READY','developer',1,1);",
+    )?;
+    for by in [super::By::Round, super::By::Commander, super::By::Direct] {
+        let stale = super::admit_one(&conn, "r", "stale", by)?;
+        assert!(
+            matches!(
+                stale,
+                Err(super::Refusal::SpecMismatch {
+                    ref task_spec,
+                    ref run_spec,
+                }) if task_spec.as_deref() == Some("s1") && run_spec.as_deref() == Some("s2")
+            ),
+            "{by:?} stale spec: {stale:?}"
+        );
+        let foreign = super::admit_one(&conn, "r", "foreign", by)?;
+        assert!(
+            matches!(
+                foreign,
+                Err(super::Refusal::SpecMismatch {
+                    ref task_spec,
+                    ref run_spec,
+                }) if task_spec.as_deref() == Some("s2") && run_spec.as_deref() == Some("s2")
+            ),
+            "{by:?} foreign run: {foreign:?}"
+        );
+    }
+    Ok(())
+}
