@@ -2369,8 +2369,8 @@ fn test_008_01_running_plan_pause_resume_approval_review() -> R {
             "writer_end={writer_end} to_plan={to_plan}"
         );
         assert_eq!(
-            world.query("SELECT mode||'/'||state FROM runs")?,
-            "PLAN/PAUSED"
+            world.query("SELECT mode||'/'||state||'/'||resume_state FROM runs")?,
+            "PLAN/PAUSED/RUNNING"
         );
         // The write set and the product digests are taken from here: nothing but the draft writes after this point.
         let status = || -> R<std::collections::BTreeSet<String>> {
@@ -2414,7 +2414,18 @@ fn test_008_01_running_plan_pause_resume_approval_review() -> R {
         let around = |order: &str, cmp: &str| -> R<String> {
             world.query(&format!("SELECT kind||'>'||coalesce(json_extract(payload_json,'$.to'),'') FROM events WHERE run_id='{run}' AND {RUN_STATE_EVENTS} AND seq{cmp}{dispatched} ORDER BY seq {order} LIMIT 1"))
         };
-        assert_eq!(around("DESC", "<")?, "run.resumed>RUNNING");
+        // The last one is either the ResumeRun's own run.resumed (its payload names the command, not the state: the
+        // run returns to its resume_state, RUNNING above, unless a blocker is claimed, and then a run.blocked follows
+        // in the same commit) or, when the run was blocked again in between, the release's run.resumed to RUNNING.
+        let last = around("DESC", "<")?;
+        let last_command = world.query(&format!(
+            "SELECT coalesce(json_extract(payload_json,'$.command_id'),'') FROM events WHERE run_id='{run}' \
+             AND {RUN_STATE_EVENTS} AND seq<{dispatched} ORDER BY seq DESC LIMIT 1"
+        ))?;
+        assert!(
+            last == "run.resumed>RUNNING" || (last == "run.resumed>" && last_command == "resume"),
+            "last run state event before the draft's dispatch: {last} (command {last_command:?})"
+        );
         assert_eq!(around("ASC", ">")?, "run.blocked>");
         // The draft's write set as Git records it (its commits, untracked files and deletions): docs/ and .hoh/ only.
         let drafted = world.query("SELECT json_extract(payload_json,'$.git_commit') FROM events WHERE kind='spec.draft_completed'")?;
