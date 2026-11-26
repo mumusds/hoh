@@ -103,7 +103,7 @@ fn test_024_05_resume_excludes_turns_only_under_a_declared_schema() {
 }
 
 #[test]
-fn test_027_01_m3cx003_exhausted_resume_declaration_is_unknown() {
+fn test_024_05_m3cx003_exhausted_resume_declaration_is_unknown() {
     use crate::compat::suite::{Part, plan};
     let schema = serde_json::json!({"oneOf":[{"properties":{"method":{"enum":["thread/resume"]},"params":{"properties":{"excludeTurns":{"type":"boolean"}}}}}]});
     for budget in [0, 1] {
