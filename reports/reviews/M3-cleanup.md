@@ -1056,3 +1056,18 @@ Round 2 dispositions (round 2 passes under the owner's round cap: no critical/hi
 | M4L3-204 | low | Backlog (outside the fix diff): `--check-stdout` on a failing log can report a false leak; the scripts run it only after a zero exit. |
 | M4L3-205 | low | Backlog: `/var/home/<user>` and `/Users/<user>` prefixes in the machine-path scan. |
 | M4L3-206 | low | Watch item: `test_sigint` in the bundle self-test timed out once at load ~7 and passed twice on rerun; not related to this package. |
+
+## FLK-17 (the fake provider logged an answer after writing it)
+
+`pre-pr` on the M4-T09 branch failed once in the bundle step: `test_record_faults.FakeProvider.test_answers_its_scenario_in_turn_and_logs_no_key`
+saw `[429, 503, 503]` instead of `[429, 503, 503, 404]`. `FakeProvider.answer` (`tests/fixtures/protocol/record_faults.py`) wrote the
+response before appending the log entry, and `close()` does not join the daemon handler threads, so a client that read the last answer
+and closed the provider at once could miss that entry. Fix ("FLK-17: the fake provider logs an answer before writing it"): the entry
+is appended under the lock before the response is written. New test `test_flk17_an_answer_is_logged_before_the_client_can_read_it`
+asserts the log length after each of 300 answers; it fails at the first request on the old order. Bundle and `pre-pr.sh` exit 0.
+
+### FLK-17: review
+
+| Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|
+| 1 | `dfba94fb` | Grok 1.0.92, `01a2190f-c665-7463-b87a-08ad4bac62e5` (`efac76e7-8c41-428f-a07b-8788b27df138`), FLK17-01..49 | PASS, no findings: with the old order restored in a copy the new test failed 20/20 (by the 4th request at the latest), on the candidate it passed 20/20; the default 404 route takes the same path; a write failure now leaves a logged entry the recorders' exact status lists reject, so a broken recording is still not published |
