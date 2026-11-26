@@ -609,6 +609,64 @@ class TestLogStreams(unittest.TestCase):
                         r=subprocess.run(['bash',str(product/script),*self.args(script)],capture_output=True,text=True,env=env,timeout=60)
                         self.assertNotEqual(r.returncode,0,f'{script} ({label}) should fail on child fd-1 leak: {r.stdout}{r.stderr}')
                         self.assertIn('fd 1',r.stderr.lower())
+    def test_m4l3_001_accepts_real_edition_2024_merged_doctest_stdout_without_counting_it(self):
+        # M4L3-001 / M4L3-100: real stdout from `cargo test --workspace --locked --no-fail-fast --doc` in this
+        # edition 2024 workspace (crates with 0 doctests + hoh-core merged & compile_fail doctests + rustdoc footer).
+        real_doctest_stdout=(
+            '\nrunning 0 tests\n\n'
+            'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\n'
+            'running 0 tests\n\n'
+            'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\n'
+            'running 0 tests\n\n'
+            'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\n'
+            'running 1 test\n'
+            'test crates/hoh-core/src/persistence/need.rs - persistence::need::VerifierReason (line 168) ... ok\n\n'
+            'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\n'
+            'running 1 test\n'
+            'test crates/hoh-core/src/persistence/need.rs - persistence::need::VerifierReason (line 164) - compile fail ... ok\n\n'
+            'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s\n\n'
+            'all doctests ran in 0.31s; merged doctests compilation took 0.25s\n'
+        )
+        with tempfile.TemporaryDirectory(prefix='hoh-m4l3-001-') as d:
+            d=Path(d);log=d/'doctest.log';out=d/'out.jsonl'
+            log.write_text(real_doctest_stdout,encoding='utf-8')
+            r=subprocess.run(
+                [sys.executable,str(ROOT/'scripts/product/test_results.py'),'--log',str(log),'--out',str(out),'--check-stdout'],
+                capture_output=True,text=True,timeout=30,
+            )
+            self.assertEqual(r.returncode,0,f'real doctest stdout rejected: {r.stderr}')
+            self.assertEqual(out.read_text(encoding='utf-8'),'')
+            # A near-miss or trailing text on the rustdoc line must still be rejected.
+            bad_log=d/'doctest-bad.log'
+            bad_log.write_text(real_doctest_stdout+'all doctests ran in 0.31s; merged doctests compilation took 0.25s leaked\n',encoding='utf-8')
+            bad=subprocess.run(
+                [sys.executable,str(ROOT/'scripts/product/test_results.py'),'--log',str(bad_log),'--check-stdout'],
+                capture_output=True,text=True,timeout=30,
+            )
+            self.assertNotEqual(bad.returncode,0,'doctest footer with trailing text should be rejected')
+            # End-to-end through cargo-tests.sh unit (the path that appends `--doc`).
+            product=d/'repo/scripts/product';product.mkdir(parents=True)
+            for name in ('cargo-tests.sh','test_results.py'):shutil.copy(ROOT/'scripts/product'/name,product/name)
+            bin_=d/'bin';bin_.mkdir()
+            doc_fixture=d/'doctest-fixture.txt';doc_fixture.write_text(real_doctest_stdout,encoding='utf-8')
+            fake_cargo=(
+                '#!/usr/bin/env bash\n'
+                'if [[ " $* " == *" --doc "* ]]; then\n'
+                '  cat "$DOC_FIXTURE"\n'
+                '  exit 0\n'
+                'fi\n'
+                'printf "\\nrunning 1 test\\n"\n'
+                'printf "test cli::test_001_01_unit ... ok\\n"\n'
+                'printf "\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n\\n"\n'
+            )
+            cargo=bin_/'cargo';cargo.write_text(fake_cargo,encoding='utf-8');cargo.chmod(0o755)
+            evidence=d/'evidence';evidence.mkdir()
+            env={**os.environ,'PATH':f'{bin_}:{os.environ["PATH"]}','HOH_EVIDENCE_DIR':str(evidence),'DOC_FIXTURE':str(doc_fixture)}
+            u=subprocess.run(['bash',str(product/'cargo-tests.sh'),'unit'],capture_output=True,text=True,env=env,timeout=60)
+            self.assertEqual(u.returncode,0,f'cargo-tests.sh unit failed on real doctest stdout: {u.stdout}{u.stderr}')
+            self.assertIn('unit: 3 tests passed.',u.stderr)
+            rows=[json.loads(line) for line in (evidence/'test-results.jsonl').read_text(encoding='utf-8').splitlines()]
+            self.assertEqual([(row['test_id'],row['status']) for row in rows],[('TEST-001-01','PASS')])
     def test_m3r1003_recovery_fails_when_cargo_fails_inside_real_systemd_scope(self):
         # M3R-1003: recovery.sh's second run takes its pipe status from real `systemd-run --user --scope`; prove a
         # failing cargo inside the real delegated scope fails the check with cargo's exit code and records FAIL.

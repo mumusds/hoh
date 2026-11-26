@@ -14,6 +14,9 @@ LINE = re.compile(r'^test (?P<name>.+?) \.\.\. (?P<result>ok|FAILED|ignored)\b')
 STRICT_LINE = re.compile(r'^test (?P<name>.+?) \.\.\. (?P<result>ok|FAILED|ignored)(?P<tail>, .*)?$')
 RUNNING = re.compile(r'^running \d+ tests?$')
 RUNNING_LONG = re.compile(r'^test .+? has been running for over \d+ seconds$')
+DOCTEST_MERGED = re.compile(
+    r'^all doctests ran in \d+(?:\.\d+)?s; merged doctests compilation took \d+(?:\.\d+)?s$'
+)
 SUMMARY = re.compile(
     r'^test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; '
     r'(?P<ignored>\d+) ignored; \d+ measured; \d+ filtered out(?:; finished in .*)?$'
@@ -57,7 +60,7 @@ def check_stdout(log: str) -> list[str]:
                     in_failure_list = False
                 continue
             in_failure_list = False
-        if line == '' or RUNNING.match(line) or RUNNING_LONG.match(line):
+        if line == '' or RUNNING.match(line) or RUNNING_LONG.match(line) or DOCTEST_MERGED.match(line):
             continue
         m = STRICT_LINE.match(line)
         if m and (m['result'] == 'ignored' or not m['tail']):
