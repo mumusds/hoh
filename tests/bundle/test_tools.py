@@ -667,6 +667,81 @@ class TestLogStreams(unittest.TestCase):
             self.assertIn('unit: 3 tests passed.',u.stderr)
             rows=[json.loads(line) for line in (evidence/'test-results.jsonl').read_text(encoding='utf-8').splitlines()]
             self.assertEqual([(row['test_id'],row['status']) for row in rows],[('TEST-001-01','PASS')])
+    def test_m4l3_101_rejects_spurious_failure_windows_extra_running_and_orphan_zero_summary(self):
+        # M4L3-101: in an all-green log (or after a completed summary), leaked child output disguised as
+        # `failures:` + indented lines, a `---- ... stdout|stderr ----` section, an extra `running N tests`,
+        # or an orphan 0-count summary must be rejected. Real failing-test output and genuine empty suites remain valid.
+        green=(
+            '\nrunning 1 test\n'
+            'test test_001_01_ok ... ok\n\n'
+            'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'
+        )
+        zero_summary='test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'
+        failing_block=(
+            '\nrunning 1 test\n'
+            'test test_001_01_bad ... FAILED\n\n'
+            'failures:\n\n'
+            '---- test_001_01_bad stdout ----\n'
+            "thread 'test_001_01_bad' panicked at crates/a/src/lib.rs:10:5:\n"
+            'assertion failed\n\n'
+            'failures:\n'
+            '    test_001_01_bad\n\n'
+            'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'
+        )
+        reject_cases=[
+            ('failures_frame_in_green',
+             '\nrunning 1 test\nfailures:\n    leaked child payload\n\ntest test_001_01_ok ... ok\n\n'
+             'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'),
+            ('failures_no_blank_in_green',
+             '\nrunning 1 test\nfailures:\n    leaked child payload\ntest test_001_01_ok ... ok\n\n'
+             'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'),
+            ('failures_frame_after_summary',
+             green+'failures:\n    leaked after summary\n\n'),
+            ('section_in_green',
+             '\nrunning 1 test\ntest test_001_01_ok ... ok\n---- leak stdout ----\nleaked child payload\n\n'
+             'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'),
+            ('section_after_green_summary',
+             green+'---- leak stdout ----\nleaked after summary\n'),
+            ('section_after_failing_summary',
+             failing_block+'---- leak stderr ----\nleaked after failing summary\n'),
+            ('extra_running_inside_block',
+             '\nrunning 1 test\nrunning 9 tests\ntest test_001_01_ok ... ok\n\n'
+             'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'),
+            ('extra_running_after_summary',
+             green+'running 9 tests\n'),
+            ('orphan_zero_summary_after_summary',
+             green+zero_summary),
+            ('orphan_zero_summary_inside_block',
+             '\nrunning 1 test\n'+zero_summary+'test test_001_01_ok ... ok\n\n'
+             'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'),
+            ('running_count_mismatch',
+             '\nrunning 2 tests\ntest test_001_01_ok ... ok\n\n'
+             'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'),
+        ]
+        with tempfile.TemporaryDirectory(prefix='hoh-m4l3-101-') as d:
+            d=Path(d)
+            for label,payload in reject_cases:
+                with self.subTest(reject=label):
+                    log=d/f'{label}.log'
+                    log.write_text(payload,encoding='utf-8')
+                    r=subprocess.run(
+                        [sys.executable,str(ROOT/'scripts/product/test_results.py'),'--log',str(log),'--check-stdout'],
+                        capture_output=True,text=True,timeout=30,
+                    )
+                    self.assertNotEqual(r.returncode,0,f'{label} should be rejected by --check-stdout')
+            # Genuine failing-test log and genuine empty binary must still be accepted.
+            for label,payload in [
+                ('real_failing_block',failing_block),
+                ('real_empty_binary','\nrunning 0 tests\n\n'+zero_summary),
+            ]:
+                with self.subTest(accept=label):
+                    log=d/f'{label}.log'
+                    log.write_text(payload,encoding='utf-8')
+                    r=subprocess.run(
+                        [sys.executable,str(ROOT/'scripts/product/test_results.py'),'--log',str(log),'--check-stdout'],
+                        capture_output=True,text=True,timeout=30,
+                    )
+                    self.assertEqual(r.returncode,0,f'{label} should be accepted: {r.stderr}')
     def test_m3r1003_recovery_fails_when_cargo_fails_inside_real_systemd_scope(self):
         # M3R-1003: recovery.sh's second run takes its pipe status from real `systemd-run --user --scope`; prove a
         # failing cargo inside the real delegated scope fails the check with cargo's exit code and records FAIL.
