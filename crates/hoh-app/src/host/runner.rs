@@ -1718,15 +1718,16 @@ async fn attempt(
     // An unknown effect has no result to record: its work effect stays STARTED, so a crash from here on settles it
     // UNKNOWN_EFFECT too.
     if !unknown
-        && !store
-            .runner_effect(
+        && !lasting(store, hooks, &id, || {
+            store.runner_effect(
                 &id,
                 &key,
                 EffectState::Started,
                 EffectState::Observed,
-                observed,
+                observed.clone(),
             )
-            .await?
+        })
+        .await?
     {
         return Ok(());
     }
@@ -1736,8 +1737,8 @@ async fn attempt(
     // Its leader ended: the attempt ends, and its slot with it, only if the executor emptied its group first
     // (M2T05R-101, -202); else it stays RUNNING with its slot held, and a diagnostic says why.
     if !outcome.group_gone {
-        store
-            .commit(Commit {
+        lasting(store, hooks, &id, || {
+            store.commit(Commit {
                 events: vec![NewEvent {
                     intent: Intent::Record,
                     project_id: common.shared.project_id.clone(),
@@ -1749,7 +1750,8 @@ async fn attempt(
                 }],
                 ..Commit::default()
             })
-            .await?;
+        })
+        .await?;
         return Ok(());
     }
     // Its group is empty: its processes outside the group are stopped too, and it ends, its slot with it, only with the
@@ -1790,8 +1792,8 @@ async fn attempt(
                  attempt and its slot stay",
             )
         };
-        store
-            .commit(Commit {
+        lasting(store, hooks, &id, || {
+            store.commit(Commit {
                 events: vec![NewEvent {
                     intent: Intent::Record,
                     project_id: common.shared.project_id.clone(),
@@ -1802,21 +1804,23 @@ async fn attempt(
                 }],
                 ..Commit::default()
             })
-            .await?;
+        })
+        .await?;
         if proof != Proof::Done {
             return Ok(());
         }
     }
     if !unknown
-        && !store
-            .runner_effect(
+        && !lasting(store, hooks, &id, || {
+            store.runner_effect(
                 &id,
                 &key,
                 EffectState::Observed,
                 EffectState::Committed,
                 json!({}),
             )
-            .await?
+        })
+        .await?
     {
         return Ok(());
     }
@@ -1868,7 +1872,7 @@ async fn attempt(
         };
         let identity = identity_of(&work)?;
         finished(common, &id, ran.as_ref(), ending, |e| {
-            super::completion::complete_verifier(store, &identity, e, Some(reporting))
+            super::completion::complete_verifier(store, &identity, e, Some(reporting), hooks)
         })
         .await?;
         remove_run_dir().await;
@@ -1901,8 +1905,11 @@ async fn attempt(
             ending.detail = format!("SPEC_REVIEW_NOT_REPORTED: its end was lost: {e}");
             (ending, None)
         });
-        finished(common, &id, ran.as_ref(), ending, |e| {
-            store.finish_spec_review(&id, e, intake)
+        let id = id.as_str();
+        finished(common, id, ran.as_ref(), ending, |e| {
+            lasting(store, common.shared.hooks.as_ref(), id, move || {
+                store.finish_spec_review(id, e.clone(), intake.clone())
+            })
         })
         .await?;
         remove_run_dir().await;
@@ -1915,7 +1922,9 @@ async fn attempt(
         super::control::recorded_end(&common.shared.root, move |workspace| {
             let mut ending = ending.clone();
             ending.observed.workspace = workspace;
-            store.runner_finished(id, ending)
+            lasting(store, hooks, id, move || {
+                store.runner_finished(id, ending.clone())
+            })
         })
     })
     .await?;
@@ -2010,6 +2019,25 @@ async fn refuse_draft_gate(
     Ok(())
 }
 
+/// Make `write`, which records what attempt `id`'s process did or does (a request it made, its end, its result),
+/// through [`hoh_core::persistence::Store::lasting`]: made again while it meets `DB_BUSY`, for two more busy timeouts
+/// after the first, each time a new request at the end of the writer's queue, [`RunnerPoint::RetryingBusy`] before
+/// each (DC-FLK14b addendum, M3F-001: else one `DB_BUSY` ends the attempt `runner_error` and its result is lost).
+pub(super) async fn lasting<T, F, Fut>(
+    store: &hoh_core::persistence::Store,
+    hooks: &dyn HostHooks,
+    id: &str,
+    write: F,
+) -> Result<T, PersistError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, PersistError>>,
+{
+    store
+        .lasting(write, || hooks.runner_of(RunnerPoint::RetryingBusy, id))
+        .await
+}
+
 /// Hand attempt `id`'s `ending` to the store by `hand`: every runner path that ends an attempt goes through here
 /// (docs/adr/ADR-030.md decision 2, M2T15D-07). A failure of the Auth class first goes to the registry as what the turn
 /// that `ran` found: latched as its agent's fact only when it ran under the agent's current identity no earlier than
@@ -2093,18 +2121,22 @@ async fn serve_request(
                             .handoff
                             .as_ref()
                             .map_or("", |h| h.round_id.as_str());
-                        match v {
-                            Some(v) => {
-                                super::requests::answer_message(
-                                    store,
-                                    message,
-                                    round,
-                                    &v.candidate_id,
-                                )
-                                .await?
+                        let hooks = common.shared.hooks.as_ref();
+                        lasting(store, hooks, &work.attempt_id, || async {
+                            match v {
+                                Some(v) => {
+                                    super::requests::answer_message(
+                                        store,
+                                        message,
+                                        round,
+                                        &v.candidate_id,
+                                    )
+                                    .await
+                                }
+                                None => super::requests::answer_work(store, message).await,
                             }
-                            None => super::requests::answer_work(store, message).await?,
-                        }
+                        })
+                        .await?
                     }
                     (None, refused) => json!({"status": "refused",
                         "reasons": [refused.map_or("not a message".to_owned(), |r| r.reason.clone())]}),
@@ -2166,8 +2198,8 @@ async fn run_check(
     .await
     .map_err(|e| PersistError::Storage(format!("the plan's read ended: {e}")))?;
     let refused = |reasons: Vec<String>| async move {
-        store
-            .commit(Commit {
+        lasting(store, common.shared.hooks.as_ref(), &work.attempt_id, || {
+            store.commit(Commit {
                 events: vec![NewEvent {
                     intent: Intent::Progress,
                     project_id: common.shared.project_id.clone(),
@@ -2178,8 +2210,9 @@ async fn run_check(
                 }],
                 ..Commit::default()
             })
-            .await
-            .map(|_| json!({"status": "refused", "reasons": reasons}))
+        })
+        .await
+        .map(|_| json!({"status": "refused", "reasons": reasons}))
     };
     let Some(argv) = argv.filter(|a| !a.is_empty()) else {
         return refused(vec![format!(
@@ -2245,19 +2278,17 @@ async fn answer_bridge_messages(
         .handoff
         .as_ref()
         .map_or("", |h| h.round_id.as_str());
+    let (store, hooks) = (&common.shared.store, common.shared.hooks.as_ref());
     for message in &parsed.messages {
-        match v {
-            Some(v) => {
-                super::requests::answer_message(
-                    &common.shared.store,
-                    message,
-                    round,
-                    &v.candidate_id,
-                )
-                .await
+        lasting(store, hooks, &work.attempt_id, || async {
+            match v {
+                Some(v) => {
+                    super::requests::answer_message(store, message, round, &v.candidate_id).await
+                }
+                None => super::requests::answer_work(store, message).await,
             }
-            None => super::requests::answer_work(&common.shared.store, message).await,
-        }?;
+        })
+        .await?;
     }
     Ok(())
 }

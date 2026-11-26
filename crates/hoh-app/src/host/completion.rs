@@ -477,6 +477,7 @@ pub(super) async fn complete_verifier(
     identity: &Identity,
     ending: Ending,
     reporting: Option<Reporting>,
+    hooks: &dyn super::HostHooks,
 ) -> Result<hoh_core::persistence::VerifierCompleted, PersistError> {
     let held = identity.clone();
     let (outcome, ending) = super::begun::spawn_blocking(move || {
@@ -486,13 +487,16 @@ pub(super) async fn complete_verifier(
     })
     .await
     .map_err(|e| PersistError::Storage(format!("the completion of a verifier ended: {e}")))?;
-    store
-        .complete_verifier_attempt(VerifierCompletion {
-            attempt_id: identity.attempt_id.clone(),
-            ending,
-            outcome,
-        })
-        .await
+    let completion = VerifierCompletion {
+        attempt_id: identity.attempt_id.clone(),
+        ending,
+        outcome,
+    };
+    // What its process did is recorded even past a DB_BUSY (DC-FLK14b addendum).
+    super::runner::lasting(store, hooks, &identity.attempt_id, || {
+        store.complete_verifier_attempt(completion.clone())
+    })
+    .await
 }
 
 /// Complete writer attempt `identity.attempt_id`, which ended successfully with its processes proven gone: its outcome
@@ -510,8 +514,9 @@ pub(super) async fn complete(
     let draft = store
         .reader()
         .and_then(|reader| reader.draft_start(&attempt_id));
+    let completing = hooks.clone();
     let (outcome, ending) = super::begun::spawn_blocking(move || {
-        hooks.completing(&identity.attempt_id);
+        completing.completing(&identity.attempt_id);
         let mut ending = ending;
         let outcome = match draft {
             Ok(Some(start)) => super::drafting::outcome(&held, &identity, &mut ending, &start),
@@ -527,14 +532,22 @@ pub(super) async fn complete(
     })
     .await
     .map_err(|e| PersistError::Storage(format!("the completion of a writer ended: {e}")))?;
-    super::control::recorded_end(project, move |workspace| {
+    super::control::recorded_end(project, |workspace| {
         let mut ending = ending.clone();
         ending.observed.workspace = workspace;
-        store.complete_writer_attempt(WriterCompletion {
+        let completion = WriterCompletion {
             attempt_id: attempt_id.clone(),
             ending,
             outcome: outcome.clone(),
-        })
+        };
+        let (hooks, attempt_id) = (hooks.clone(), attempt_id.clone());
+        // What its process did is recorded even past a DB_BUSY (DC-FLK14b addendum).
+        async move {
+            super::runner::lasting(store, hooks.as_ref(), &attempt_id, || {
+                store.complete_writer_attempt(completion.clone())
+            })
+            .await
+        }
     })
     .await
 }
@@ -593,7 +606,7 @@ pub(super) async fn recover(
     } else {
         // A verifier's: its result from the same bridge (decision 11); its final message is not kept across a restart,
         // so a COMPLETED result cannot be reported here and is corrected (verified again).
-        complete_verifier(store, &identity, ending, None)
+        complete_verifier(store, &identity, ending, None, &super::NoHostFaults)
             .await
             .map(|_| WriterCompleted::AlreadyEnded)
     }

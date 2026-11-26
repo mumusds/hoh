@@ -1039,6 +1039,90 @@ async fn test_062_01_a_queued_write_is_busy_one_timeout_after_its_submission() -
     Ok(())
 }
 
+/// M3F-001 (DC-FLK14b addendum): a write that records work already done is made again after its `DB_BUSY`, as a new
+/// request, and commits once the outside lock goes; held longer, its `DB_BUSY` comes once LASTING_BUSY_TIMEOUTS busy
+/// timeouts have passed since its first, and nothing was written.
+#[tokio::test]
+async fn test_062_01_a_lasting_write_outlasts_an_outside_lock_for_two_more_busy_timeouts() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let busy = Duration::from_millis(300);
+    let store = Store::open(
+        &path,
+        Options {
+            busy_timeout: busy,
+            ..test_options()
+        },
+    )?;
+    seed(&path)?;
+    let before = snapshot(&path)?;
+    let commit = || {
+        store.commit(Commit {
+            cas: vec![cas(0, RunState::Discovering)],
+            events: vec![event("e1")],
+            outbox: vec![],
+        })
+    };
+    // Held until the write's first DB_BUSY, released by the test there: the write's next request commits.
+    let external = std::sync::Mutex::new(Some(Connection::open(&path)?));
+    if let Some(c) = external.lock().map_err(|e| e.to_string())?.as_ref() {
+        c.execute_batch("BEGIN IMMEDIATE")?;
+    }
+    let retries = std::sync::atomic::AtomicU32::new(0);
+    let started = Instant::now();
+    store
+        .lasting(commit, || {
+            retries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(c) = external.lock().ok().and_then(|mut c| c.take()) {
+                let _ = c.execute_batch("ROLLBACK");
+            }
+        })
+        .await?;
+    assert!(started.elapsed() >= busy, "{:?}", started.elapsed());
+    assert_eq!(retries.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_ne!(snapshot(&path)?, before);
+    // Never released: DB_BUSY LASTING_BUSY_TIMEOUTS busy timeouts after the first, one busy timeout after submission.
+    let after = snapshot(&path)?;
+    let external = Connection::open(&path)?;
+    external.execute_batch("BEGIN IMMEDIATE")?;
+    let started = Instant::now();
+    let first = std::sync::Mutex::new(None);
+    let held = store
+        .lasting(
+            || {
+                store.commit(Commit {
+                    cas: vec![],
+                    events: vec![event("e2")],
+                    outbox: vec![],
+                })
+            },
+            || {
+                if let Ok(mut first) = first.lock() {
+                    first.get_or_insert_with(Instant::now);
+                }
+            },
+        )
+        .await;
+    let (waited, first) = (
+        started.elapsed(),
+        first.lock().map_err(|e| e.to_string())?.ok_or("no retry")?,
+    );
+    assert!(
+        matches!(&held, Err(e @ PersistError::Busy(_)) if e.retryable()),
+        "{held:?}"
+    );
+    let lasted = first.duration_since(started);
+    assert!(lasted >= busy, "first DB_BUSY after {lasted:?}");
+    assert!(
+        waited >= lasted + busy * LASTING_BUSY_TIMEOUTS
+            && waited <= lasted + busy * (LASTING_BUSY_TIMEOUTS + 1) + Duration::from_millis(500),
+        "DB_BUSY {waited:?} after it was submitted, its first after {lasted:?}"
+    );
+    external.execute_batch("ROLLBACK")?;
+    assert_eq!(snapshot(&path)?, after);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_full_queue_holds_callers_back_and_loses_nothing() -> R {
     let dir = tempfile::tempdir()?;

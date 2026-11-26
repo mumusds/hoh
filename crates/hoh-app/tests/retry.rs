@@ -851,7 +851,11 @@ async fn test_062_01_an_attempts_end_outlasts_an_outside_write_lock() -> R {
         )? == "0"
     {
         if Instant::now() > end {
-            return Err(format!("Td did not end; hooks saw {:?}", hooks.seen.lock().map(|s| s.clone())).into());
+            return Err(format!(
+                "Td did not end; hooks saw {:?}",
+                hooks.seen.lock().map(|s| s.clone())
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -870,7 +874,10 @@ async fn test_062_01_an_attempts_end_outlasts_an_outside_write_lock() -> R {
         (&json!("SETTLED"), &json!("COMMITTED")),
         "{attempts:?}; hooks saw {seen:?}"
     );
-    assert_eq!(query(&db, "SELECT state FROM tasks WHERE task_id = 'Td'")?, "IMPLEMENTED");
+    assert_eq!(
+        query(&db, "SELECT state FROM tasks WHERE task_id = 'Td'")?,
+        "IMPLEMENTED"
+    );
     // The lock was held until the write met DB_BUSY and went again.
     assert_eq!(seen.len(), 2, "{seen:?}");
     assert!(seen[0].ends_with(": locked"), "{seen:?}");

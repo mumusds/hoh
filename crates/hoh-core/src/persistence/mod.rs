@@ -1030,6 +1030,14 @@ impl EvidenceHandle {
     }
 }
 
+/// How many busy timeouts after its first `DB_BUSY` a write that records work already done is still made again
+/// ([`Store::lasting`], DC-FLK14b addendum): with the busy timeout of its first try it outlasts an outside write lock
+/// that ends within three busy timeouts (15 s at the initial 5000 ms) of its first submission.
+pub const LASTING_BUSY_TIMEOUTS: u32 = 2;
+
+/// The pause before a [`Store::lasting`] write is made again.
+const LASTING_PAUSE: Duration = Duration::from_millis(20);
+
 /// An open project database: the writer actor and the means to open readers.
 #[derive(Debug)]
 pub struct Store {
@@ -1121,6 +1129,40 @@ impl Store {
             writer,
             watermark,
         })
+    }
+
+    /// Make `write`, one or more requests of this store that record work already done outside it (what an agent's
+    /// process did, what was delivered to it), and make it again while it fails with `DB_BUSY`, until
+    /// [`LASTING_BUSY_TIMEOUTS`] busy timeouts after its first `DB_BUSY`; then that `DB_BUSY` (DC-FLK14b addendum,
+    /// reports/reviews/M3-cleanup.md). Each time is a new request at the end of the writer's queue with a lock wait of
+    /// its own, so what is queued behind it is not held up past its own deadline; `retrying` is called before each.
+    /// `write` must be safe to make again after a `DB_BUSY`, which writes nothing. Any other result is returned.
+    pub async fn lasting<T, F, Fut>(
+        &self,
+        mut write: F,
+        retrying: impl Fn(),
+    ) -> Result<T, PersistError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, PersistError>>,
+    {
+        let until = self.options.busy_timeout * LASTING_BUSY_TIMEOUTS;
+        let mut first_busy = None;
+        loop {
+            match write().await {
+                Err(PersistError::Busy(detail)) => {
+                    let since = *first_busy.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= until {
+                        return Err(PersistError::Busy(detail));
+                    }
+                    retrying();
+                    // A busy wait that ended at once (a request that waited out its deadline in the queue) is not
+                    // made again in a tight loop.
+                    tokio::time::sleep(LASTING_PAUSE).await;
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Commit `commit` in one IMMEDIATE transaction on the writer: all of it or nothing.

@@ -170,12 +170,14 @@ impl Transport for HostTransport<'_> {
                     Ok(Ok(SteerReceipt::Rejected { reason })) => InputOutcome::Rejected(reason),
                     _ => InputOutcome::Rejected("UNKNOWN_DELIVERY".into()),
                 };
+                // The agent was handed the input: its outcome is recorded even past a DB_BUSY (DC-FLK14b addendum).
+                let finish = InputRouting::Finish {
+                    input_id: input.input_id,
+                    attempt: work.attempt_id.clone(),
+                    outcome,
+                };
                 store
-                    .route_input(InputRouting::Finish {
-                        input_id: input.input_id,
-                        attempt: work.attempt_id.clone(),
-                        outcome,
-                    })
+                    .lasting(|| store.route_input(finish.clone()), || {})
                     .await
                     .map_err(delivery_error)?
                     .reply
