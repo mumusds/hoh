@@ -1007,3 +1007,7 @@ Verification after fix (under `/home/ai/dev/.hoh-test-slot.lock`, same 12 CPU bu
 - Regression/mutation check: temporarily disabling the M1T08R-19 pre-read guard in `crates/hoh-client/src/tui.rs:730` turned the fixed test red (`left: ""`, `right: "echo NEXT\n"`, `sabotage-m1t08r19.log`); reverted immediately.
 
 Evidence under `.hoh-dev/self-tests/flk16/`: `ci-like-failure.log`, `strace-single.log`, `repro-before-load.log`, `repro-before-run-5.log`, `strace-det-red-{1..3}.log`, `repro-after-load.log`, `sabotage-m1t08r19.log`. Self-tests, not acceptance.
+
+### FLK-16: review
+
+Developer: agy 1.5.17 (gemini-4-neon-high), attempt `1a4d19e9-7a0e-4454-b8c8-2b9182768f9f`; test and record changes only. Review: fresh Grok 1.0.92 session `01a21624-960d-7782-bf3f-4674e70b6024` (attempt `0f958b6d-5a3f-4975-bc4e-a7e262e188e7`), FLK16-001..099, on `09377776`: **PASS**, no findings. The reviewer re-read the three strace logs (the second initial-frame `write` trapped by `TCOOFF`, zero `read(0)` before exit), checked the poll syscall numbers (x86_64 7/271, aarch64 73; other architectures do not compile, as with `in_write`), re-ran the M1T08R-19 sabotage (exit 101, `left: ""`) and both tests 5/5.
