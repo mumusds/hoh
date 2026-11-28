@@ -337,7 +337,8 @@ pub(super) fn decide_in(
                         proposal.decision_id
                     ))
                 })?;
-                event_seqs.push(super::plan::import_in(tx, plan, ctx)?.1);
+                event_seqs
+                    .push(super::plan::import_in(tx, plan, Some(&proposal.decision_id), ctx)?.1);
             }
             resolve(tx, &proposal.decision_id, "APPLIED", None)?;
             Decided::Applied {
@@ -346,7 +347,14 @@ pub(super) fn decide_in(
             }
         }
         Err(rejection) => {
-            let mut event = rejected(&project_id, proposal, &snapshot, context, &rejection);
+            let mut event = rejected(
+                &project_id,
+                proposal,
+                &snapshot,
+                context,
+                &rejection,
+                &payload,
+            );
             event.payload["causation_id"] = json!(proposal.causation_id);
             event.payload["decided_at"] = json!(crate::time::rfc3339_utc(context.now()));
             if let Some(output_id) = output_id {
@@ -705,17 +713,20 @@ pub(super) fn lease_task(
     })
 }
 
-/// The one event of a rejected proposal, with the fences and inputs the verdict read.
+/// The one event of a rejected proposal, with the fences and inputs the verdict read and the checked `proposed`
+/// payload, as `decision.applied` carries it (CR-043): what it proposed and its basis are public.
 fn rejected(
     project_id: &str,
     proposal: &Proposal,
     snapshot: &Snapshot,
     context: &Context,
     rejection: &Rejection,
+    proposed: &Value,
 ) -> NewEvent {
     let mut payload = json!({
         "decision_id": proposal.decision_id,
         "kind": proposal.kind(),
+        "payload": proposed,
         "reason_code": reason_name(rejection.reason),
         "detail": rejection.detail,
         "role_epoch": proposal.role_epoch,

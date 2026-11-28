@@ -623,22 +623,27 @@ fn person(
         ..Commit::default()
     };
     // The question as asked (docs/adr/ADR-031.md decision 6): its id is the request's decision id, its words the
-    // Commander's own.
+    // Commander's own, with its public basis when it gave one (CR-043; none: no key, unknown to a client).
     if let DecisionPayload::RequestUserDecision {
         question_id,
         question,
         choices,
         requires_user,
+        basis,
     } = &proposal.payload
     {
+        let mut asked = json!({"question_id": proposal.decision_id, "commander_question_id": question_id,
+            "question": question, "choices": choices, "requires_user": requires_user});
+        if let Some(basis) = basis {
+            asked["basis"] = json!(basis);
+        }
         commit.events.push(NewEvent {
             intent: Intent::Progress,
             project_id: project_id.to_owned(),
             event_id: child_id(&proposal.decision_id, "question"),
             run_id: Some(run_id.to_owned()),
             kind: super::need::QUESTION_ASKED.to_owned(),
-            payload: json!({"question_id": proposal.decision_id, "commander_question_id": question_id,
-                "question": question, "choices": choices, "requires_user": requires_user}),
+            payload: asked,
         });
     }
     let moved = blockers::follow(

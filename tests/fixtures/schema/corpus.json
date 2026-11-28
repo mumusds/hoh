@@ -883,6 +883,43 @@
   },
   {
    "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": true,
+   "note": "CR-043: request_user_decision with its basis",
+   "instance": {
+    "kind": "request_user_decision",
+    "question_id": "q1",
+    "question": "Which?",
+    "requires_user": true,
+    "basis": "docs/adr/ADR-031.md decision 7; scope is the user's"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": true,
+   "note": "CR-043: create_tasks with its basis",
+   "instance": {
+    "kind": "create_tasks",
+    "plan": {
+     "tasks": [
+      {
+       "task_id": "T1",
+       "title": "Build",
+       "role": "developer",
+       "writer": true,
+       "depends_on": [],
+       "requirement_ids": [
+        "REQ-001"
+       ]
+      }
+     ]
+    },
+    "basis": "REQ-001 AC-001-01 is not covered by any task"
+   }
+  },
+  {
+   "schema": "protocol",
    "def": "PlanProposal",
    "valid": true,
    "note": "plan with scores",
@@ -2350,6 +2387,43 @@
       "choice_id": "a"
      }
     ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": false,
+   "note": "CR-043: an empty basis",
+   "instance": {
+    "kind": "create_tasks",
+    "plan": {
+     "tasks": [
+      {
+       "task_id": "T1",
+       "title": "Build",
+       "role": "developer",
+       "writer": true,
+       "depends_on": [],
+       "requirement_ids": [
+        "REQ-001"
+       ]
+      }
+     ]
+    },
+    "basis": ""
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": false,
+   "note": "CR-043: a basis that is not text",
+   "instance": {
+    "kind": "request_user_decision",
+    "question_id": "q1",
+    "question": "Which?",
+    "requires_user": true,
+    "basis": 7
    }
   },
   {

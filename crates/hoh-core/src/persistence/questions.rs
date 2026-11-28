@@ -198,7 +198,8 @@ pub struct Question {
     pub route: Route,
     /// The claim that holds it (run-level and the Commander's).
     pub claim: Option<String>,
-    /// Its anchor's payload (task-level), or its `question.asked`'s.
+    /// Its anchor's payload (task-level), its `question.asked`'s (the Runtime's run-level ones) or its request's
+    /// DecisionPayload (the Commander's).
     pub anchor: Value,
 }
 
@@ -774,11 +775,13 @@ pub(super) fn answer(
                 tx,
                 &Commit {
                     events: vec![
+                        // With the request's payload, as every applied decision carries its own (CR-043): its
+                        // basis is read where the other kinds' are.
                         event(
                             child_id(decision_id, "applied"),
                             "decision.applied",
                             json!({"decision_id": decision_id, "kind": "request_user_decision",
-                                "answered_by": a.command_id}),
+                                "answered_by": a.command_id, "payload": question.anchor}),
                         ),
                         need::answered(
                             a.project_id,

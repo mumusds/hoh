@@ -59,7 +59,7 @@ pub(super) fn import(
         },
         ctx,
     )?;
-    let (task_ids, event_seq) = import_in(&tx, plan, ctx)?;
+    let (task_ids, event_seq) = import_in(&tx, plan, None, ctx)?;
     super::writer::commit_unhooked(tx, ctx)?;
     Ok(Imported {
         task_ids,
@@ -218,11 +218,13 @@ pub(super) fn check(tx: &Connection, run_id: &str, raw: &Value) -> Result<ValidP
 }
 
 /// Write `plan`'s tasks, dependencies and requirements and its `plan.imported` in the caller's transaction, the one
-/// that checked it; the run's revision is not moved here (its caller moves it once). The new tasks' ids in their
-/// canonical order and the event's seq.
+/// that checked it; the run's revision is not moved here (its caller moves it once). The event names `decision`, the
+/// create_tasks that imports it, when there is one (CR-043: a client links the created tasks to it by id). The new
+/// tasks' ids in their canonical order and the event's seq.
 pub(super) fn import_in(
     tx: &Transaction<'_>,
     plan: ValidPlan,
+    decision: Option<&str>,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<(Vec<String>, i64), PersistError> {
     let ValidPlan {
@@ -302,6 +304,10 @@ pub(super) fn import_in(
         }
     }
     let task_ids: Vec<String> = plan.tasks.iter().map(|t| t.task_id.clone()).collect();
+    let mut imported = json!({ "run_id": run_id, "tasks": listed });
+    if let Some(decision) = decision {
+        imported["decision_id"] = json!(decision);
+    }
     let mut commit = Commit {
         events: vec![NewEvent {
             intent: Intent::Progress,
@@ -309,7 +315,7 @@ pub(super) fn import_in(
             event_id: child_id(run_id, &format!("plan/{}", base + 1)),
             run_id: Some(run_id.to_owned()),
             kind: "plan.imported".to_owned(),
-            payload: json!({ "run_id": run_id, "tasks": listed }),
+            payload: imported,
         }],
         ..Commit::default()
     };

@@ -36,7 +36,7 @@
 2. 归并事件：按(run, problem_fingerprint, spec_revision)去重；数据完整性与严重问题优先处理。
 3. 评估净进展向量：新增accepted AC、closed/reopened issue、新增critical/high、未消除的决策风险。连续3轮无增长且失败fingerprint重复→转recovery诊断，不再派同类任务。
 4. 选择一个动作：派发增量 / 修复issue / 研究 / 重规划 / 派发写CR的任务 / 交接 / BLOCKED / release_request。排序：关键回归与数据完整性→解阻任务→普通任务。
-5. 写决策：动作、依据（证据路径+sha256）、被拒备选、影响范围、回滚方式；重大技术或范围决定派发写ADR或CR的任务。
+5. 写决策：动作、依据（证据路径+sha256）、被拒备选、影响范围、回滚方式；重大技术或范围决定派发写ADR或CR的任务。依据写进该决策的公开字段：dispatch的note、transition_task与transition_run的reason、record_assumption的basis、create_tasks与request_user_decision的可选basis（1–4096字符）；只写公开依据与证据引用，不写隐藏推理；不写则客户端把这条决策的依据显示为unknown。
 6. 按输出契约在最终消息里给出本turn的决策块（一条，或按顺序多条），然后结束本次唤醒，等待下一事件。
 
 ## 决策规则与升级
