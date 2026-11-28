@@ -1447,7 +1447,7 @@ fn a_candidates_changed_files_are_code_entries_by_path_and_the_rest_only_counted
 
 #[test]
 fn the_commander_is_shown_the_optional_basis_of_a_request_and_of_a_plan() -> R {
-    // CR-043 decisions 1 and 4: the DecisionPayload the Commander's turn is given offers request_user_decision and
+    // CR-043 decisions 1 and 6: the DecisionPayload the Commander's turn is given offers request_user_decision and
     // create_tasks an optional basis bounded to 1..=4096 characters, and its contract tells it where each kind's basis
     // goes.
     let text = output_schemas("commander")?;

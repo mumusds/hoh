@@ -2158,7 +2158,7 @@ async fn a_plans_basis_is_published_with_its_decision_and_its_import_names_the_d
 
 #[tokio::test]
 async fn a_rejected_decision_publishes_the_proposal_it_refused_with_its_basis() -> R {
-    // CR-043 decision 2 (C2): decide's decision.rejected carries the checked DecisionPayload as `payload`, the value
+    // CR-043 decision 4 (C2): decide's decision.rejected carries the checked DecisionPayload as `payload`, the value
     // decision.applied carries, so what a refused proposal proposed and its basis (here a dispatch's note) are public;
     // the keys the rejection had keep their values and nothing else is written.
     let dir = tempfile::tempdir()?;

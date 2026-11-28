@@ -1705,7 +1705,7 @@ async fn a_commanders_question_blocks_the_run_and_its_answer_wakes_the_next_turn
 #[tokio::test]
 async fn a_commanders_request_basis_is_asked_with_its_question_and_published_when_its_answer_applies_it()
 -> R {
-    // CR-043 decisions 1 and 2 (C2) through the Commander's real output path: a request_user_decision's basis is kept
+    // CR-043 decisions 1 and 3 (C2) through the Commander's real output path: a request_user_decision's basis is kept
     // with the request (its decisions row), public in its question.asked beside the question's words, and in the
     // decision.applied its answer writes, which carries the request's payload as every other applied decision does.
     let dir = tempfile::tempdir()?;
