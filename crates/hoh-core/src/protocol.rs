@@ -564,9 +564,15 @@ pub enum DecisionPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         choices: Option<Vec<Choice>>,
         requires_user: bool,
+        /// Its public basis (CR-043): published in its `question.asked`; `None` reads as unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basis: Option<String>,
     },
     CreateTasks {
         plan: PlanProposal,
+        /// The plan decision's public basis (CR-043); `None` reads as unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basis: Option<String>,
     },
     RecordAssumption {
         statement: String,

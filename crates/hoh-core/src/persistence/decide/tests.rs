@@ -1657,7 +1657,7 @@ async fn an_invalid_plan_is_refused_with_its_code_before_any_decision_is_written
         assert_eq!(planned_tables(&path)?, before, "{tasks}");
     }
     let mut scored = commander.decide(3, 7, create_tasks(json!([planned("P1", &[], &[])])));
-    if let crate::protocol::DecisionPayload::CreateTasks { plan } = &mut scored.payload {
+    if let crate::protocol::DecisionPayload::CreateTasks { plan, .. } = &mut scored.payload {
         plan.tasks[0].user_value = Some(7);
     }
     assert!(matches!(
@@ -2091,6 +2091,128 @@ async fn test_009_01_build_rejects_the_whole_unapproved_requirement_plan_durably
             "SELECT requirement_id FROM task_requirements WHERE task_id='P1'"
         )?,
         vec![vec![json!("REQ-1")]]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_plans_basis_is_published_with_its_decision_and_its_import_names_the_decision() -> R {
+    // CR-043 decisions 1-3 (C2): a create_tasks' basis is kept with its decision (decisions.payload_json) and public
+    // in its decision.applied payload; the plan.imported its transaction writes names the decision, so a client links
+    // the created tasks to it by id, not by adjacency. A plan without a basis has no basis key (unknown to a client);
+    // its import is named all the same.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    seed(&path, REQUIREMENTS)?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    let basis = "REQ-1 的 AC 还没有任务覆盖（docs/spec.md sha256 0f3a）";
+    let mut with_basis = create_tasks(json!([planned("P1", &[], &["REQ-1"])]));
+    with_basis["basis"] = json!(basis);
+    for (revision, payload) in [
+        (7, with_basis),
+        (8, create_tasks(json!([planned("P2", &["P1"], &["REQ-1"])]))),
+    ] {
+        let decided = store
+            .decide(commander.decide(3, revision, payload), context())
+            .await?;
+        assert!(matches!(decided, Decided::Applied { .. }), "{decided:?}");
+    }
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT decision_id, json_extract(payload_json, '$.basis') FROM decisions ORDER BY rowid"
+        )?,
+        [
+            vec![json!("d1"), json!(basis)],
+            vec![json!("d2"), Value::Null]
+        ]
+    );
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT json_extract(payload_json, '$.decision_id'), json_extract(payload_json, '$.payload.basis'), \
+             json_type(payload_json, '$.payload.basis') FROM events WHERE kind = 'decision.applied' ORDER BY seq"
+        )?,
+        [
+            vec![json!("d1"), json!(basis), json!("text")],
+            vec![json!("d2"), Value::Null, Value::Null]
+        ]
+    );
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT json_extract(payload_json, '$.decision_id'), json_extract(payload_json, '$.tasks[0].task_id') \
+             FROM events WHERE kind = 'plan.imported' ORDER BY seq"
+        )?,
+        [
+            vec![json!("d1"), json!("P1")],
+            vec![json!("d2"), json!("P2")]
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rejected_decision_publishes_the_proposal_it_refused_with_its_basis() -> R {
+    // CR-043 decision 2 (C2): decide's decision.rejected carries the checked DecisionPayload as `payload`, the value
+    // decision.applied carries, so what a refused proposal proposed and its basis (here a dispatch's note) are public;
+    // the keys the rejection had keep their values and nothing else is written.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    let payload = json!({"kind": "dispatch", "task_id": "T1", "role": "developer",
+        "note": "T0 已 ACCEPTED，T1 的依赖已满足"});
+    let before = tables(&path)?;
+    let decided = store
+        .decide(commander.decide(3, 6, payload.clone()), context())
+        .await?;
+    assert!(
+        matches!(
+            decided,
+            Decided::Rejected {
+                reason: RejectionReason::StaleRevision,
+                ..
+            }
+        ),
+        "{decided:?}"
+    );
+    let rejected = rows(
+        &path,
+        "SELECT payload_json FROM events WHERE kind = 'decision.rejected'",
+    )?;
+    let [row] = rejected.as_slice() else {
+        return Err(format!("not one decision.rejected: {rejected:?}").into());
+    };
+    let rejected: Value = serde_json::from_str(row[0].as_str().ok_or("payload text")?)?;
+    assert_eq!(rejected["payload"], payload);
+    assert_eq!(
+        (
+            &rejected["decision_id"],
+            &rejected["kind"],
+            &rejected["reason_code"],
+            &rejected["expected_revision"],
+            &rejected["current_revision"]
+        ),
+        (
+            &json!("d1"),
+            &json!("dispatch"),
+            &json!("STALE_REVISION"),
+            &json!(6),
+            &json!(7)
+        )
+    );
+    assert_eq!(
+        tables(&path)?,
+        before,
+        "no task, run, outbox or attempt changed"
     );
     Ok(())
 }

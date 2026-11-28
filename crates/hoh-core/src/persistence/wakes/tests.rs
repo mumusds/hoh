@@ -6070,3 +6070,64 @@ async fn test_017_01_dropped_commander_wake_rejects_input_but_withdrawal_retries
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn a_decision_whose_basis_is_out_of_its_bound_is_an_invalid_output_and_records_no_decision()
+-> R {
+    // CR-043 decision 1: the Runtime holds a Commander's basis to 1..=4096 characters on the way in, like every
+    // DecisionPayload field: a request whose basis is longer, or empty, is disposed of invalid PAYLOAD with no decisions
+    // row, no question and no claim; the same request with a basis of exactly 4096 characters is past decide's fences.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let nonce = nonce_of(&path, &a.attempt_id)?;
+    let at = a.attempt_id.as_str();
+    let ask = |question_id: &str, basis: String| {
+        json!({"kind": "request_user_decision", "question_id": question_id, "question": "which?",
+            "requires_user": true, "basis": basis})
+    };
+    let lines = [
+        line(
+            &nonce,
+            output("m1", "decision", &w, at, 1, ask("q1", "依".repeat(4097))),
+        ),
+        line(
+            &nonce,
+            output("m2", "decision", &w, at, 1, ask("q2", String::new())),
+        ),
+        line(
+            &nonce,
+            output("m3", "decision", &w, at, 1, ask("q3", "依".repeat(4096))),
+        ),
+    ];
+    bridged_turn(&store, &clock, at, 3000, true, &lines).await?;
+    store.supervise("R", context(&clock, 4000)).await?;
+    let o = |n: usize| format!("{at}/output/{n}");
+    assert_eq!(
+        ends(&path)?,
+        [
+            (o(0), "invalid:PAYLOAD".to_owned()),
+            (o(1), "invalid:PAYLOAD".to_owned()),
+            (o(2), "unsupported".to_owned()),
+        ]
+    );
+    assert_eq!(
+        value(&path, "SELECT json_group_array(decision_id) FROM decisions")?,
+        json!([format!("{at}/m3")])
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_group_array(json_extract(payload_json, '$.commander_question_id')) FROM events \
+             WHERE kind = 'question.asked'"
+        )?,
+        json!(["q3"])
+    );
+    Ok(())
+}

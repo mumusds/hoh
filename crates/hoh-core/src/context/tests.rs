@@ -1444,3 +1444,48 @@ fn a_candidates_changed_files_are_code_entries_by_path_and_the_rest_only_counted
     assert!(failed.entries[0].text.contains("no such commit"));
     Ok(())
 }
+
+#[test]
+fn the_commander_is_shown_the_optional_basis_of_a_request_and_of_a_plan() -> R {
+    // CR-043 decisions 1 and 4: the DecisionPayload the Commander's turn is given offers request_user_decision and
+    // create_tasks an optional basis bounded to 1..=4096 characters, and its contract tells it where each kind's basis
+    // goes.
+    let text = output_schemas("commander")?;
+    let block = text
+        .lines()
+        .skip_while(|l| !l.contains("DecisionPayload"))
+        .nth(1)
+        .ok_or("no DecisionPayload block")?;
+    let schema: Value = serde_json::from_str(block)?;
+    let branches = schema["oneOf"].as_array().ok_or("no oneOf")?;
+    for kind in ["request_user_decision", "create_tasks"] {
+        let branch = branches
+            .iter()
+            .find(|b| b["properties"]["kind"]["const"] == kind)
+            .ok_or(kind)?;
+        assert_eq!(
+            (
+                &branch["properties"]["basis"]["type"],
+                &branch["properties"]["basis"]["minLength"],
+                &branch["properties"]["basis"]["maxLength"]
+            ),
+            (&json!("string"), &json!(1), &json!(4096)),
+            "{kind}"
+        );
+        assert!(
+            !branch["required"]
+                .as_array()
+                .is_some_and(|r| r.contains(&json!("basis"))),
+            "{kind}: basis is optional"
+        );
+    }
+    for field in [
+        "dispatch的note",
+        "transition_task与transition_run的reason",
+        "record_assumption的basis",
+        "create_tasks与request_user_decision的可选basis",
+    ] {
+        assert!(COMMANDER.contains(field), "the contract names {field}");
+    }
+    Ok(())
+}

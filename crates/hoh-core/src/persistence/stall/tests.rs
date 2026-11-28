@@ -1678,6 +1678,7 @@ async fn a_commanders_question_blocks_the_run_and_its_answer_wakes_the_next_turn
     )?;
     assert_eq!(asked["question"], words);
     assert_eq!(asked["commander_question_id"], "q1");
+    assert_eq!(asked.get("basis"), None, "no basis sent: none published");
     assert_eq!(result(&path)?, json!(["BLOCKED", 3]));
     let open = crate::persistence::questions::open(&Connection::open(&path)?, "R")?;
     assert_eq!(open.len(), 1);
@@ -1698,6 +1699,66 @@ async fn a_commanders_question_blocks_the_run_and_its_answer_wakes_the_next_turn
             && e["payload"]["decision_id"] == json!(decision)),
         "{shown:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_commanders_request_basis_is_asked_with_its_question_and_published_when_its_answer_applies_it()
+-> R {
+    // CR-043 decisions 1 and 2 (C2) through the Commander's real output path: a request_user_decision's basis is kept
+    // with the request (its decisions row), public in its question.asked beside the question's words, and in the
+    // decision.applied its answer writes, which carries the request's payload as every other applied decision does.
+    let dir = tempfile::tempdir()?;
+    let clock = Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    world(&path, "SPECIFYING", TWO_WAKES)?;
+    let basis = "登录方式属产品方向，须由用户决定（docs/adr/ADR-031.md 决定 7）";
+    let request = json!({"kind": "request_user_decision", "question_id": "q1", "question": "登录要支持哪些方式？",
+        "choices": [{"choice_id": "oauth", "label": "OAuth"}], "requires_user": true, "basis": basis});
+    drive(
+        &store,
+        &clock,
+        &path,
+        0,
+        10,
+        &Answer::Decide(vec![request.clone()]),
+        |p| Ok(state(p)? == json!("BLOCKED/NEED_DECISION")),
+    )
+    .await?;
+    let asked = value(
+        &path,
+        "SELECT payload_json FROM events WHERE kind = 'question.asked'",
+    )?;
+    assert_eq!(
+        (&asked["question"], &asked["basis"]),
+        (&request["question"], &json!(basis))
+    );
+    let decision = asked["question_id"]
+        .as_str()
+        .ok_or("no question id")?
+        .to_owned();
+    assert_eq!(
+        value(
+            &path,
+            &format!(
+                "SELECT json_extract(payload_json, '$.basis') FROM decisions WHERE decision_id = '{decision}'"
+            )
+        )?,
+        json!(basis)
+    );
+    store
+        .submit_command(answer_of(&path, "c1", &decision, "OAuth")?)
+        .await?;
+    let applied = value(
+        &path,
+        "SELECT payload_json FROM events WHERE kind = 'decision.applied' \
+         AND json_extract(payload_json, '$.kind') = 'request_user_decision'",
+    )?;
+    assert_eq!(
+        (&applied["decision_id"], &applied["answered_by"]),
+        (&json!(decision), &json!("c1"))
+    );
+    assert_eq!(applied["payload"], request);
     Ok(())
 }
 

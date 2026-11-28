@@ -328,3 +328,38 @@ fn deep_unknown_payloads_are_an_error_not_a_crash() -> R {
     std::mem::forget(raw); // a 100k-deep value cannot be dropped recursively on the test stack
     Ok(())
 }
+
+#[test]
+fn a_decision_basis_is_optional_and_one_to_4096_characters() -> R {
+    // CR-043 decision 1: request_user_decision and create_tasks carry an optional public `basis` of 1..=4096
+    // characters (counted as characters, not bytes); without it the payload decodes as before and encodes without the
+    // key, so an old record stays valid and reads as unknown.
+    let plan = serde_json::json!({"tasks": [{"task_id": "T1", "title": "Build", "role": "developer", "writer": true,
+        "depends_on": [], "requirement_ids": ["REQ-001"]}]});
+    let request = serde_json::json!({"kind": "request_user_decision", "question_id": "q1", "question": "Which?",
+        "requires_user": true});
+    let create = serde_json::json!({"kind": "create_tasks", "plan": plan});
+    for old in [&request, &create] {
+        let decoded: DecisionPayload = protocol::decode(old)?;
+        assert_eq!(protocol::encode(&decoded)?, *old, "no basis: unchanged");
+    }
+    for mut raw in [request, create] {
+        raw["basis"] = Value::String("依".repeat(4096));
+        let decoded: DecisionPayload = protocol::decode(&raw)?;
+        let basis = match &decoded {
+            DecisionPayload::RequestUserDecision { basis, .. }
+            | DecisionPayload::CreateTasks { basis, .. } => basis.clone(),
+            other => return Err(format!("decoded as {other:?}").into()),
+        };
+        assert_eq!(basis.map(|b| b.chars().count()), Some(4096));
+        assert_eq!(protocol::encode(&decoded)?, raw, "the basis round trips");
+        raw["basis"] = Value::String("依".repeat(4097));
+        assert!(
+            protocol::decode::<DecisionPayload>(&raw).is_err(),
+            "4097 characters"
+        );
+        raw["basis"] = Value::String(String::new());
+        assert!(protocol::decode::<DecisionPayload>(&raw).is_err(), "empty");
+    }
+    Ok(())
+}
