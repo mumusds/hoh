@@ -1,8 +1,8 @@
 # CR-042 · M4 预建、来源绑定的百万事件 fixture
 
 ID：CR-042
-状态：DRAFT
-批准人：项目所有者 2026-11-28 选定选项 A（决定记录见“依据”）；决定 1“锁”一项是 CTO 在这一选择之下对选项 A 原文 “under the measurement locks” 的读法；条文待独立 Review，之后由主会话置 APPROVED 并 relock
+状态：APPROVED
+批准人：项目所有者 2026-11-28 选定选项 A（决定记录见“依据”）；决定 1“锁”一项是 CTO 在这一选择之下对选项 A 原文 “under the measurement locks” 的读法；两轮各两个互补的独立 Review 会话见“审查记录”；主会话于 2026-11-28 置 APPROVED 并 relock
 日期：2026-11-28
 关联：REQ-064（AC-064-01 / TEST-064-01），CR-028 §5.1（CR28D-205、CR28D-301、CR28D-302、CR28D-303、C5、预算表），M4-T03、M4-T10，ADR-042（M4 release 测量阶段）
 
@@ -49,6 +49,7 @@ M4-T03 的 C5 可行性探针 R0/R0b 实测了这一条（只读引用，未在�
      - 旧进程干净关闭（不留 `-wal`/`-shm`/`-journal`）且读回完成后，最后写出 manifest：先写同目录的临时文件并 fsync，再原子 rename，然后 fsync 目录。manifest 写出后，fixture 根不再修改。
      - 被中断或失败的准备命令不留下 manifest，它的根因此不可能被 `fixture_verify` 接受。
      - 命令退出前终止并回收自己启动的子进程；共享锁随最后一个持有它的 FD 关闭而释放。子进程残留期间，独占测量仍不能开始。
+     - 共享锁由启动准备命令的外部包装器持有，命令及其后代不继承该 FD；包装器把 SIGTERM/SIGINT 转发给命令的进程组，按 PID/start_time 身份等全部后代结束后才关闭锁 FD。命令被 SIGKILL 时由包装器回收后代；包装器自身被 SIGKILL 时锁随其 FD 释放，残留后代按记录的身份清理（CR042-404）。
 2. **摘要冻结入环境。** 候选冻结前，manifest 的 sha256 写入 `.hoh-dev/environment.json` 的 `m4_reference.fixture`（CR-028 §5.1 已为 m4_reference 规定 fixture 项），candidate.environment 的摘要因此绑定它。
    - fixture 身份的输入：pin；准备命令、造库驱动源文件与 helper 包；旧二进制与 helper 的 hash；toolchain、`cc` 与构建 argv；fixture 参数。其中任一变化，下一次冻结前必须先造出新 fixture 和新 manifest，再更新 `m4_reference.fixture`。系统 `cc` 或 Rust 补丁升级改变了 helper 或旧二进制的 hash，同样属于 fixture 身份变化。检查中能观察到的变化，由 `fixture_verify` 直接判 FAIL（第 3 条）。
    - 这种情况下，CR-028:294 的“同 fixture 对照测量”在新 fixture 上进行，并记录新旧 manifest 摘要。两份 fixture 的读回在规模与形状上须相同；数据库 hash 不要求相同。
@@ -71,7 +72,7 @@ M4-T03 的 C5 可行性探针 R0/R0b 实测了这一条（只读引用，未在�
       - 本次观察到的 `cc --version`、pin toolchain 的 `rustc -vV` 与 `cargo -V`，等于构建记录；
       - fixture 参数等于第 1 条的规模。
    5. **读回**：用 helper 读回数据库副本，结果与 manifest 的读回逐项相等。读回还须**独立于 manifest 的自报值**满足下列条件，期望值来自本 CR 与 CR-028 的常数，不来自 manifest：
-      - `user_version=2`，`sqlite_master` 中没有任何 003 的表、索引或触发器；数据库头为 WAL 模式（文件头第 18、19 字节为 2）；
+      - `user_version=2`，`sqlite_master` 中没有任何 003 的表、索引或触发器；数据库头为 WAL 模式（文件头第 18、19 字节为 2）；`immutable=1` 打开时 helper 读到的 `journal_mode` 不是头部读数，WAL 模式只以头部字节判定（CR042-402）；
       - Run 恰好 100 个，全部为终态；每个 Run 恰好 10 个 iteration，每个都由 pin 的生产关轮事件关闭（关闭 seq 非空且大于开始 seq）；没有可调度的 Task，没有未结束的 Attempt；
       - `events` 行数与最大 seq 都 ≥1,000,000；造库驱动的事件全部随某个已结束 Attempt 的结束写入，并落在该 Attempt 所属 iteration 的开始与关闭之间；
       - 已登记对象恰好 10,000 个，每个 16,384 字节；每个对象的文件都在副本中，sha256 等于登记值与逐对象清单；每个对象都被其 Attempt 的登记事件引用，每个引用都指向存在的对象行与文件；
@@ -155,6 +156,7 @@ CR-028:977（第 3 轮处置导语，“生命周期/造库仍须遵守第4轮�
 - M4-T03：交付准备命令（含构建记录、manifest 原子写出与读回）、`fixture_verify`（含决定 3 的负例）及其失败记录；`release_build` 只构建候选与 helper；冻结前在 m4_reference 中填 `fixture` 摘要与 `fixture_verify` 时限。T03 可以现在用真实旧 writer 造一次库（约 70 分钟），再做其余阶段的 C5 实测。
 - M4-T05、M4-T07、M4-T10：重测含 `fixture_verify` 的五阶段；fixture 的身份变化（决定 2 所列输入）先换 fixture 与 manifest 再冻结。
 - `.hoh-dev/environment.json`：冻结前新增 `m4_reference.fixture`；不修改已冻结的环境。
+- `fixture_verify` 因 fixture 身份变化（如系统 `cc` 或 toolchain 补丁升级）而 FAIL 时，恢复步骤是：用准备命令在新根中造新 fixture（约 70 分钟），把新 manifest 摘要写入 `m4_reference.fixture`，在下一次冻结前完成；期间的 integration 照实 FAIL，不改为 SKIPPED（CR042-403）。`fixture_verify` 的 600 s 上限含复制、重算 hash、备份与 integrity_check，在 C5 实测中覆盖；超出则按 C5 以正式 CR 重规划。
 - 不改 14 项检查的归属、mode、超时，不改 release-policy 或 gate。
 
 ## 是否属于 CR-003 D1
@@ -186,3 +188,11 @@ CR-028:977（第 3 轮处置导语，“生命周期/造库仍须遵守第4轮�
 | CR042-205 | low | 改正：两处证据路径都写出，sha256 相同 | 依据 |
 | CR042-206 | low | 改正：helper hash 变化（含系统 `cc` 变化所致）是 fixture 身份变化，下一次冻结前重造；`fixture_verify` 核对 helper、`cc` 与 toolchain | 决定 2、决定 3 第 4 步 |
 | CR042-207 | low | 改正：manifest 最后原子写出；中断不留 manifest，不覆盖已完成的 fixture 根；退出时回收子进程、释放锁 | 决定 1“写出与中断” |
+
+| 轮 | 冻结提交 | 审查者与报告 | 结论 |
+|---|---|---|---|
+| 2 | “CR-042: round-1 revisions (REQ-064)” | Codex，编号 CR042-300..399，`/home/ai/dev/hoh/.hoh-dev/cr042/review-r2-codex-final.txt` | PASS，无发现 |
+| 2 | 同上 | Pi，会话 `01a21ff1-638b-70a0-b3a6-c1c6e6034b7c`，编号 CR042-400..499，`/home/ai/dev/hoh/.hoh-dev/cr042/review-r2-pi-final.txt` | PASS：401..404 low |
+
+第 2 轮的处置（主会话，批准提交）：CR042-402、403、404 为文字补充，已写入决定 1、决定 3 第 5 步与“影响”；CR042-401（终态断言加“派发通知为 0”）推迟到 M4-T03 的 R3 实现，ADR-042 的 `FIXTURE_NOT_QUIESCENT` 条件与 backfill 不变量已覆盖，记入 M4 低项清单。
+
