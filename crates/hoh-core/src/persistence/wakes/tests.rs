@@ -952,6 +952,14 @@ async fn a_plan_naming_the_commander_or_a_supervision_task_is_refused() -> R {
     store
         .import_plan("R", json!({"tasks": [planned("Z", "developer", &["D"])]}))
         .await?;
+    // CR-043 decision 5: a plan imported without a decision names none, so clients read its decision as unknown.
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_type(payload_json, '$.decision_id') IS NULL FROM events WHERE kind = 'plan.imported'"
+        )?,
+        json!(1)
+    );
     Ok(())
 }
 
@@ -6074,7 +6082,7 @@ async fn test_017_01_dropped_commander_wake_rejects_input_but_withdrawal_retries
 #[tokio::test]
 async fn a_decision_whose_basis_is_out_of_its_bound_is_an_invalid_output_and_records_no_decision()
 -> R {
-    // CR-043 decision 1: the Runtime holds a Commander's basis to 1..=4096 characters on the way in, like every
+    // CR-043 decision 2: the Runtime holds a Commander's basis to 1..=4096 characters on the way in, like every
     // DecisionPayload field: a request whose basis is longer, or empty, is disposed of invalid PAYLOAD with no decisions
     // row, no question and no claim; the same request with a basis of exactly 4096 characters is past decide's fences.
     let dir = tempfile::tempdir()?;

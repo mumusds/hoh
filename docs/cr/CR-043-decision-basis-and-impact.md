@@ -1,8 +1,8 @@
 # CR-043 · 决策依据与影响的生产者（C2）
 
 ID：CR-043
-状态：DRAFT
-批准人：待独立 Review 与 CTO 按 CR-003 D1 审批
+状态：APPROVED
+批准人：CTO 按 CR-003 D1 于 2026-11-28 批准；独立 Review 一轮（Pi，PASS，只有 low）见“审查记录”
 日期：2026-11-28
 关联：CR-028 的 C2（§2“决策依据与影响”、D 表 C2 行、M4A-503、M4-T02 done_when 的 C2 句），REQ-010 AC-010-01 / TEST-010-01，CTO 决定 Q8（`.hoh-dev/evidence/m4-t02-prep/cto-decisions-2026-11-27.md`），M4-T02 增量清单（`inventory-2026-11-27.md` 第 101、118、184、284、304 行）；REQ-035、ADR-011 §3、ADR-031 决定 2、6、7
 
@@ -12,7 +12,7 @@ C2：每项 decision 的依据来自已公开的 basis/reason/note 字段，影�
 
 ## 一、六类决策的依据与影响（代码事实，基线 main `50d8fd60`）
 
-**客户端读得到什么。** `GET /v1/events`（`crates/hoh-app/src/host/http.rs:95`）把每条已提交事件连同完整 payload 按 seq 发出（`event_json`，http.rs:1660-1671；只按 run_id/kinds 过滤）；`GET /v1/runs/{run_id}`（http.rs:1545）给投影，其中 `projection.questions` 是待答问题（http.rs:1614）。CR-028 §4 D3 的分类：`decision.applied`、`decision.rejected` 为 P,I（CR-028:386），`plan.imported` 为 I（CR-028:387），`question.asked`、`question.answered` 为 I（CR-028:393），`need_decision` 为 I（CR-028:405），`run.blocked`、`run.blocker_claimed`、`run.blocker_released` 为 P（CR-028:385）。每条事件的来源 id 是它的 seq 与 event_id；决策事件另名出 `decision_id`（decide 路径为消息 id，`crates/hoh-core/src/decision.rs:69`；Commander 输出路径为 `<attempt_id>/<message_id>`，`crates/hoh-core/src/persistence/outputs.rs:557`）。
+**客户端读得到什么。** `GET /v1/events`（`crates/hoh-app/src/host/http.rs:95`）把每条已提交事件连同完整 payload 按 seq 发出（`event_json`，http.rs:1660-1671；只按 run_id/kinds 过滤）；`GET /v1/runs/{run_id}`（http.rs:1545）给投影，其中 `projection.questions` 是待答问题（http.rs:1614）。CR-028 §4 D3 的分类：`decision.applied`、`decision.rejected` 为 P,I（CR-028:386），`plan.imported` 为 I（CR-028:387），`question.asked`、`question.answered` 为 I（CR-028:393），`need_decision` 为 I（CR-028:405），`run.blocked`、`run.blocker_claimed`、`run.blocker_released` 为 P（CR-028:385）。每条事件的来源 id 是它的 seq 与 event_id；决策事件另名出 `decision_id`（decide 路径为消息 id，`crates/hoh-core/src/decision.rs:69`；Commander 输出路径为 `<attempt_id>/<message_id>`，`crates/hoh-core/src/persistence/outputs.rs:556`）。
 
 **持久化。** 每条过了 schema 的决策，其 `protocol::encode` 后的 DecisionPayload 进 `decisions.payload_json`（`crates/hoh-core/src/persistence/decide.rs:179-180`、`:219-230`）；这是内部表，客户端不读。`decision.applied` 的 payload 原样带这份 DecisionPayload（键 `payload`，decide.rs:524-528，事件 decide.rs:608-616，event_id `<decision_id>/applied`，decide.rs:612），所以“依据字段公开”就是它在 `decision.applied.payload.payload.<字段>` 里。
 
@@ -59,7 +59,7 @@ C2：每项 decision 的依据来自已公开的 basis/reason/note 字段，影�
 
 ## 四、M4-T02 S5 仍负责
 
-- **渲染。** Workspace 的决策行按第一节逐类取依据：dispatch→`note`，transition_task/transition_run→`reason`，record_assumption→`basis`，create_tasks→`basis`（均在 `decision.applied.payload.payload` 或 `decision.rejected.payload.payload`），request_user_decision→`question.asked.basis`（应用后另在 `decision.applied.payload.payload.basis`）；影响取第一节“影响”列的事件与键，带各自 seq/event_id 作来源；被拒决策显示 reason_code。不把提议当已发生效果（被拒的 `payload` 是提议，不是影响）。
+- **渲染。** Workspace 的决策行按第一节逐类取依据：dispatch→`note`，transition_task/transition_run→`reason`，record_assumption→`basis`，create_tasks→`basis`（均在 `decision.applied.payload.payload` 或 `decision.rejected.payload.payload`），request_user_decision→`question.asked.basis`（应用后另在 `decision.applied.payload.payload.basis`）；影响取第一节“影响”列的事件与键，带各自 seq/event_id 作来源；被拒决策显示 reason_code。不把提议当已发生效果（被拒的 `payload` 是提议，不是影响）。只对六类 DecisionPayload kind 渲染决策行：`commander_message` 对旧 epoch 的非决策消息（steer、query 等）以 STALE_ROLE_EPOCH 写出的 `decision.rejected` 不是决策，不进本表（CR043-105）。
 - **unknown 的显示。** 键不存在（Commander 没写可选依据；本 CR 之前的旧记录没有 `basis`、`decision_id`、`payload`）即 unknown，不计 PASS，不按相邻 seq 或 task_id 重合去补关联，不写占位依据或“无影响”之类的推断。record_assumption 没有 Task/Run/计划效果、被拒决策没有效果：S5 按 C2 定它们的影响列显示（显示该事实本身，或 unknown），但不得算作“带 impact”的正例。
 - **TEST-010-01 的否定例。** “缺 basis/reason/note 的决策”与“缺已提交 effects 的决策”各一，经真实生产者产生并保留来源：前者可用不带可选依据的 dispatch 或 create_tasks；后者从真实生产者给出的事实里选（例如尚未答复的 request_user_decision——决策行 PROPOSED，没有 `decision.applied`；或 record_assumption 的“只记录”），选择与断言（显示 unknown、不计 PASS、已有项保留真实来源）属 S5 与 TEST-010-01。本 CR 不写 `test_010_01` 测试，不改客户端代码。
 
@@ -75,8 +75,9 @@ C2：每项 decision 的依据来自已公开的 basis/reason/note 字段，影�
 
 - 先红后绿，测试以所证事实命名（不用 `test_010_01`，它的 then 证据属 M4-T02）：schema 语料新增四例（两例有效、两例无效）；`protocol_roundtrip` 的 `a_decision_basis_is_optional_and_one_to_4096_characters`；context 的 `the_commander_is_shown_the_optional_basis_of_a_request_and_of_a_plan`；decide 的 `a_plans_basis_is_published_with_its_decision_and_its_import_names_the_decision`、`a_rejected_decision_publishes_the_proposal_it_refused_with_its_basis`；Commander 输出路径的 `a_decision_whose_basis_is_out_of_its_bound_is_an_invalid_output_and_records_no_decision`、`a_commanders_request_basis_is_asked_with_its_question_and_published_when_its_answer_applies_it`；既有 `a_commanders_question_blocks_the_run_and_its_answer_wakes_the_next_turn_with_it` 加断言：没写依据时 `question.asked` 没有 `basis` 键。既有用例只有一处随类型改：decide 测试里对 `CreateTasks { plan }` 的模式加 `..`（断言不变）。红/绿记录在 `.hoh-dev/self-tests/cr043/`。
 - 分支：`cargo clippy --workspace --all-targets --locked -- -D warnings`、完整 `cargo test --workspace --locked`（改协议，docs/24 §5）、`bash scripts/check.sh --bundle`（DRAFT 分支的 baseline 不符如实报告，不改基线消除）、前台 `bash scripts/dev/pre-pr.sh`。
-- 本分支不 relock，CR 保持 DRAFT；只在 `mktemp -d -p /home/ai/dev` 建的本任务 scratch 副本中临时写 APPROVED、`python3 tools/baseline.py relock --cr CR-043`、`bash scripts/check.sh --bundle`，记录退出码后删除副本（spec 视图不变，`python3 tools/gen_spec_views.py` 只核对无差异）。独立 Review 与批准由指挥安排。
+- 本分支不 relock，CR 保持 DRAFT；只在 `mktemp -d -p /home/ai/dev` 建的本任务 scratch 副本中临时写 APPROVED、`python3 tools/baseline.py relock --cr docs/cr/CR-043-decision-basis-and-impact.md`、`bash scripts/check.sh --bundle`，记录退出码后删除副本（spec 视图不变，`python3 tools/gen_spec_views.py` 只核对无差异）。独立 Review 与批准由指挥安排。
 
 ## 审查记录
 
-（待独立 Review。）
+- 第 1 轮：Pi，会话 `01a2215c-e312-774e-83fd-8cfbdb99f8bb`（attempt `67c7dcd2`），finding CR043-100..199，候选 `7b15224c`：**PASS**，无 critical/high/medium，low 101–108。审查独立复现了六类对照表的每个 file:line、基线上的红、全量测试与 scratch relock/bundle。开发者 CR043-D2 的两项加法（`decision.rejected.payload`、`plan.imported.decision_id`）判为 C2 所需，保留；公开被拒提议不暴露其他公开事件之外的内容（同为 Commander 的决策文本，未通过校验的输出不写任何 decision.* 事件，event_id 与重放不变）。
+- 批准时处理：101（测试注释的决定编号）、102（outputs.rs 行号）、104（relock 命令写文件路径）、105（§四只渲染六类决策）已改；103 在 `a_plan_naming_the_commander_or_a_supervision_task_is_refused` 加断言：不经决策导入的 `plan.imported` 没有 `decision_id`（变异为总写该键时失败）；107 把红/绿记录复制到主检出 `.hoh-dev/evidence/cr043/`。106（分步红记录）不补：断言的键只能由接线产生，审查已复现红。108（`projection.questions` 不含 basis）交 M4-T02 S5 决定是否顺带加键（自由对象，不需 CR）。
